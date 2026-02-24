@@ -47,6 +47,11 @@ type ChatMessage = {
   citations?: Citation[];
 };
 
+type SealLogoProps = {
+  size?: number;
+  style?: object;
+};
+
 const API_BASE_URL = 'http://127.0.0.1:2818';
 const API_ERROR_MESSAGE_MAP: Record<string, string> = {
   'Email already registered': '邮箱已被注册',
@@ -191,6 +196,53 @@ async function readApiResponse<T>(response: Response): Promise<{ data: T | null;
   } catch {
     return { data: null, rawText };
   }
+}
+
+function SealLogo({ size = 40, style }: SealLogoProps): React.JSX.Element {
+  const radius = Math.max(8, Math.round(size * 0.22));
+  const inset = Math.max(4, Math.round(size * 0.12));
+  const corner = Math.max(4, Math.round(size * 0.16));
+  const glyphSize = Math.max(14, Math.round(size * 0.46));
+
+  return (
+    <View style={[styles.sealLogoFrame, { width: size, height: size, borderRadius: radius }, style]}>
+      <View
+        style={[
+          styles.sealLogoCore,
+          {
+            top: inset,
+            right: inset,
+            bottom: inset,
+            left: inset,
+            borderRadius: Math.max(6, Math.round(radius * 0.7)),
+          },
+        ]}
+      >
+        <Text
+          style={[
+            styles.sealLogoGlyph,
+            {
+              fontSize: glyphSize,
+              lineHeight: Math.round(glyphSize * 1.05),
+            },
+          ]}
+        >
+          岐
+        </Text>
+      </View>
+      <View style={[styles.sealLogoCorner, styles.sealLogoCornerTopLeft, { width: corner, height: corner }]} />
+      <View
+        style={[styles.sealLogoCorner, styles.sealLogoCornerTopRight, { width: corner, height: corner }]}
+      />
+      <View
+        style={[styles.sealLogoCorner, styles.sealLogoCornerBottomLeft, { width: corner, height: corner }]}
+      />
+      <View
+        style={[styles.sealLogoCorner, styles.sealLogoCornerBottomRight, { width: corner, height: corner }]}
+      />
+      <View style={styles.sealLogoGloss} />
+    </View>
+  );
 }
 
 function SnapshotRawPanel({ snapshot }: { snapshot: HealthSnapshot }): React.JSX.Element {
@@ -944,7 +996,7 @@ function LoginScreen(): React.JSX.Element {
                 {chatLoading ? (
                   <View style={styles.chatLoadingOverlay}>
                     <View style={styles.chatLoadingCard}>
-                      <View style={styles.chatLoadingSeal} />
+                      <SealLogo size={42} style={styles.chatLoadingSeal} />
                       <Text style={styles.chatLoadingTitle}>岐元灵术正在推演方略</Text>
                       <Text style={styles.chatLoadingSubtitle}>
                         正在检索经典与健康数据，请稍候
@@ -959,7 +1011,7 @@ function LoginScreen(): React.JSX.Element {
         ) : (
           <View style={[styles.content, styles.contentSpacing]}>
             <View style={styles.titleBlock}>
-              <View style={styles.seal} />
+              <SealLogo size={44} style={styles.titleSeal} />
               <Text style={styles.cnTitle}>岐元灵术</Text>
               <Text style={styles.enTitle}>QiAlchemy</Text>
               <Text style={styles.subtitle}>中医养生与AI融合实验</Text>
@@ -1265,12 +1317,69 @@ const styles = StyleSheet.create({
   titleBlock: {
     paddingTop: 8,
   },
-  seal: {
-    width: 38,
-    height: 38,
-    borderRadius: 4,
+  titleSeal: {
     marginBottom: 14,
-    backgroundColor: '#a7342d',
+  },
+  sealLogoFrame: {
+    alignItems: 'center',
+    justifyContent: 'center',
+    backgroundColor: '#8c2f28',
+    borderWidth: 1,
+    borderColor: '#b95a4d',
+    overflow: 'hidden',
+    shadowColor: '#4f1e1a',
+    shadowOpacity: 0.22,
+    shadowRadius: 6,
+    shadowOffset: {
+      width: 0,
+      height: 3,
+    },
+    elevation: 3,
+  },
+  sealLogoCore: {
+    position: 'absolute',
+    alignItems: 'center',
+    justifyContent: 'center',
+    backgroundColor: '#f8e9d8',
+    borderWidth: 1,
+    borderColor: '#e5b78f',
+  },
+  sealLogoGlyph: {
+    color: '#8a3028',
+    fontWeight: '700',
+    textAlign: 'center',
+    fontFamily: Platform.OS === 'ios' ? 'STKaiti' : 'serif',
+  },
+  sealLogoCorner: {
+    position: 'absolute',
+    backgroundColor: 'rgba(246, 216, 187, 0.95)',
+    borderRadius: 2,
+  },
+  sealLogoCornerTopLeft: {
+    top: 3,
+    left: 3,
+  },
+  sealLogoCornerTopRight: {
+    top: 3,
+    right: 3,
+  },
+  sealLogoCornerBottomLeft: {
+    bottom: 3,
+    left: 3,
+  },
+  sealLogoCornerBottomRight: {
+    bottom: 3,
+    right: 3,
+  },
+  sealLogoGloss: {
+    position: 'absolute',
+    top: 2,
+    left: 4,
+    width: '60%',
+    height: '36%',
+    borderRadius: 8,
+    backgroundColor: 'rgba(255, 241, 225, 0.25)',
+    transform: [{ rotate: '-14deg' }],
   },
   cnTitle: {
     color: '#2f2115',
@@ -1573,11 +1682,7 @@ const styles = StyleSheet.create({
     alignItems: 'center',
   },
   chatLoadingSeal: {
-    width: 34,
-    height: 34,
-    borderRadius: 5,
     marginBottom: 10,
-    backgroundColor: '#a7342d',
   },
   chatLoadingTitle: {
     color: '#4c311d',
