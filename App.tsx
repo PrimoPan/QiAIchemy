@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import {
   ActivityIndicator,
   Alert,
@@ -30,6 +30,21 @@ type AuthUser = {
   username?: string;
   name?: string;
   email: string;
+};
+
+type AppPanel = 'home' | 'chat';
+
+type Citation = {
+  label: string;
+  sourceTitle: string;
+  sectionTitle?: string;
+};
+
+type ChatMessage = {
+  id: string;
+  role: 'user' | 'assistant';
+  content: string;
+  citations?: Citation[];
 };
 
 const API_BASE_URL = 'http://127.0.0.1:2818';
@@ -74,6 +89,28 @@ function localizeErrorMessage(message: string, fallbackMessage: string): string 
   }
 
   return trimmedMessage;
+}
+
+function toPlainChatText(markdownText: string): string {
+  const normalized = markdownText.replace(/\r\n/g, '\n');
+  const withoutFences = normalized.replace(/```[\s\S]*?```/g, block =>
+    block.replace(/```[a-zA-Z0-9_-]*\n?/g, '').replace(/```/g, ''),
+  );
+
+  return withoutFences
+    .replace(/!\[([^\]]*)\]\([^)]+\)/g, '$1')
+    .replace(/\[([^\]]+)\]\([^)]+\)/g, '$1')
+    .replace(/^>\s?/gm, '')
+    .replace(/^#{1,6}\s*/gm, '')
+    .replace(/`([^`]+)`/g, '$1')
+    .replace(/\*\*([^*]+)\*\*/g, '$1')
+    .replace(/__([^_]+)__/g, '$1')
+    .replace(/\*([^*\n]+)\*/g, '$1')
+    .replace(/_([^_\n]+)_/g, '$1')
+    .replace(/^\s*[-+*]\s+/gm, '• ')
+    .replace(/[ \t]+\n/g, '\n')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
 }
 
 function formatMetric(value: number | undefined | null, digits = 0): string {
@@ -263,12 +300,18 @@ function LoginScreen(): React.JSX.Element {
   const [healthError, setHealthError] = useState('');
   const [healthAuthorized, setHealthAuthorized] = useState<boolean | null>(null);
   const [visualReady, setVisualReady] = useState(false);
+  const [activePanel, setActivePanel] = useState<AppPanel>('home');
+  const [chatInput, setChatInput] = useState('');
+  const [chatMessages, setChatMessages] = useState<ChatMessage[]>([]);
+  const [chatLoading, setChatLoading] = useState(false);
+  const [chatSessionId, setChatSessionId] = useState(0);
 
   const [profilePanelVisible, setProfilePanelVisible] = useState(false);
   const [editorVisible, setEditorVisible] = useState(false);
   const [editorMode, setEditorMode] = useState<EditorMode>('name');
   const [editorValue, setEditorValue] = useState('');
   const [avatarSeed, setAvatarSeed] = useState(() => Math.floor(Math.random() * 100000));
+  const chatScrollRef = useRef<ScrollView | null>(null);
 
   const canUseHealth = Boolean(token);
 
@@ -281,6 +324,30 @@ function LoginScreen(): React.JSX.Element {
     (usernameChecking ||
       usernameAvailable === false ||
       (normalizedUsername.length > 0 && !USERNAME_REGEX.test(normalizedUsername)));
+
+  const createMessageId = () => `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+
+  const scrollChatToBottom = (animated = true) => {
+    requestAnimationFrame(() => {
+      chatScrollRef.current?.scrollToEnd({ animated });
+    });
+  };
+
+  const startNewChat = (showAlert = false) => {
+    setChatSessionId(prev => prev + 1);
+    setChatMessages([
+      {
+        id: createMessageId(),
+        role: 'assistant',
+        content:
+          '新对话已开始。请告诉我你最近最困扰的健康问题，我会结合中医思路给出7天可执行建议。',
+      },
+    ]);
+    setChatInput('');
+    if (showAlert) {
+      Alert.alert('已开始新会话', '已清空历史上下文，避免不同会话内容互相干扰');
+    }
+  };
 
   const checkUsernameAvailable = async (
     rawUsername: string
@@ -362,6 +429,12 @@ function LoginScreen(): React.JSX.Element {
       clearTimeout(timer);
     };
   }, [mode, normalizedUsername]);
+
+  useEffect(() => {
+    if (activePanel === 'chat' && chatMessages.length > 0) {
+      scrollChatToBottom(true);
+    }
+  }, [activePanel, chatMessages.length]);
 
   const onSubmit = async () => {
     const normalizedBase = API_BASE_URL.replace(/\/+$/, '');
@@ -465,6 +538,11 @@ function LoginScreen(): React.JSX.Element {
       setHealthError('');
       setHealthAuthorized(null);
       setVisualReady(false);
+      setActivePanel('home');
+      setChatInput('');
+      setChatMessages([]);
+      setChatLoading(false);
+      setChatSessionId(0);
       setProfilePanelVisible(false);
 
       Alert.alert('成功', mode === 'login' ? '登录成功' : '注册并登录成功');
@@ -555,6 +633,106 @@ function LoginScreen(): React.JSX.Element {
     }
   };
 
+  const onOpenChat = () => {
+    if (!token) {
+      Alert.alert('提示', '请先登录');
+      return;
+    }
+    setTestMode(false);
+    setActivePanel('chat');
+    startNewChat(false);
+    setProfilePanelVisible(false);
+  };
+
+  const onSendChat = async () => {
+    const question = chatInput.trim();
+    if (!question) {
+      return;
+    }
+    if (!token) {
+      Alert.alert('提示', '请先登录');
+      return;
+    }
+    if (chatLoading) {
+      return;
+    }
+
+    const normalizedBase = API_BASE_URL.replace(/\/+$/, '');
+    const userMessage: ChatMessage = {
+      id: createMessageId(),
+      role: 'user',
+      content: question,
+    };
+    const previousTurns = chatMessages
+      .filter(item => item.role === 'user' || item.role === 'assistant')
+      .slice(-12)
+      .map(item => ({ role: item.role, content: item.content }));
+
+    setChatInput('');
+    setChatMessages(prev => [...prev, userMessage]);
+    setChatLoading(true);
+    try {
+      const response = await fetch(`${normalizedBase}/api/agent/chat/health`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify({
+          message: question,
+          topK: 6,
+          history: previousTurns,
+        }),
+      });
+
+      const { data } = await readApiResponse<{
+        message?: string;
+        answer?: string;
+        citations?: Array<{ label?: string; sourceTitle?: string; sectionTitle?: string }>;
+      }>(response);
+
+      if (!response.ok || !data?.answer) {
+        const fallbackMessage =
+          response.status >= 500
+            ? `服务暂时不可用（HTTP ${response.status}）`
+            : `对话失败（HTTP ${response.status}）`;
+        throw new Error(localizeErrorMessage(data?.message ?? '', fallbackMessage));
+      }
+
+      const citations: Citation[] = (data.citations ?? [])
+        .filter(item => item.label && item.sourceTitle)
+        .map(item => ({
+          label: item.label as string,
+          sourceTitle: item.sourceTitle as string,
+          sectionTitle: item.sectionTitle,
+        }));
+      const plainAnswer = toPlainChatText(data.answer as string);
+
+      setChatMessages(prev => [
+        ...prev,
+        {
+          id: createMessageId(),
+          role: 'assistant',
+          content: plainAnswer,
+          citations,
+        },
+      ]);
+    } catch (error) {
+      const rawMessage = error instanceof Error ? error.message : '';
+      const message = localizeErrorMessage(rawMessage, '网络错误，请稍后重试');
+      setChatMessages(prev => [
+        ...prev,
+        {
+          id: createMessageId(),
+          role: 'assistant',
+          content: `本次请求失败：${message}`,
+        },
+      ]);
+    } finally {
+      setChatLoading(false);
+    }
+  };
+
   const onLogout = () => {
     setToken('');
     setCurrentUser(null);
@@ -572,6 +750,11 @@ function LoginScreen(): React.JSX.Element {
     setHealthAuthorized(null);
     setVisualReady(false);
     setTestMode(false);
+    setActivePanel('home');
+    setChatInput('');
+    setChatMessages([]);
+    setChatLoading(false);
+    setChatSessionId(0);
     setProfilePanelVisible(false);
     setEditorVisible(false);
     setMode('login');
@@ -667,232 +850,347 @@ function LoginScreen(): React.JSX.Element {
         behavior={Platform.OS === 'ios' ? 'padding' : undefined}
         style={styles.flex}
       >
-        <View style={[styles.content, styles.contentSpacing]}>
-          <View style={styles.titleBlock}>
-            <View style={styles.seal} />
-            <Text style={styles.cnTitle}>岐元灵术</Text>
-            <Text style={styles.enTitle}>QiAlchemy</Text>
-            <Text style={styles.subtitle}>中医养生与AI融合实验</Text>
-          </View>
+        {token && activePanel === 'chat' ? (
+          <View style={styles.chatFullscreen}>
+            <View style={styles.chatSurface}>
+              <View style={styles.chatPanel}>
+                <View style={styles.chatHeaderRow}>
+                  <Pressable
+                    style={styles.chatHeaderButton}
+                    onPress={() => {
+                      setActivePanel('home');
+                      setTestMode(false);
+                    }}
+                  >
+                    <Text style={styles.chatHeaderButtonText}>返回首页</Text>
+                  </Pressable>
+                  <Text style={styles.chatHeaderTitle}>中医智能对话</Text>
+                  <Pressable style={styles.chatHeaderButton} onPress={() => startNewChat(true)}>
+                    <Text style={styles.chatHeaderButtonText}>开始新聊天</Text>
+                  </Pressable>
+                </View>
 
-          {!token ? (
-            <View style={styles.card}>
-              <View style={styles.tabWrap}>
-                <Pressable
-                  style={[styles.tabButton, mode === 'login' && styles.tabButtonActive]}
-                  onPress={() => {
-                    setMode('login');
-                    setConfirmPassword('');
-                    setUsernameChecking(false);
-                    setUsernameAvailable(null);
-                    setUsernameHint('');
-                  }}
-                >
-                  <Text style={[styles.tabText, mode === 'login' && styles.tabTextActive]}>登录</Text>
-                </Pressable>
-                <Pressable
-                  style={[styles.tabButton, mode === 'register' && styles.tabButtonActive]}
-                  onPress={() => {
-                    setMode('register');
-                    setLoginId('');
-                  }}
-                >
-                  <Text style={[styles.tabText, mode === 'register' && styles.tabTextActive]}>注册</Text>
-                </Pressable>
-              </View>
+                <Text style={styles.chatSessionTag}>会话 #{chatSessionId}（独立上下文）</Text>
 
-              {mode === 'login' ? (
-                <>
-                  <Text style={styles.label}>账号</Text>
-                  <TextInput
-                    autoCapitalize="none"
-                    placeholder="请输入用户名或邮箱"
-                    placeholderTextColor="#99866b"
-                    style={styles.input}
-                    value={loginId}
-                    onChangeText={setLoginId}
-                  />
-                </>
-              ) : (
-                <>
-                  <Text style={styles.label}>用户名</Text>
-                  <TextInput
-                    autoCapitalize="none"
-                    placeholder="请输入用户名（3-24位）"
-                    placeholderTextColor="#99866b"
-                    style={styles.input}
-                    value={username}
-                    onChangeText={setUsername}
-                  />
-                  {usernameChecking ? (
-                    <Text style={styles.usernameHint}>正在校验用户名...</Text>
-                  ) : usernameHint ? (
-                    <Text
+                <ScrollView
+                  ref={chatScrollRef}
+                  style={styles.chatScroll}
+                  contentContainerStyle={styles.chatScrollContent}
+                  keyboardShouldPersistTaps="handled"
+                  showsVerticalScrollIndicator
+                  onContentSizeChange={() => scrollChatToBottom(true)}
+                >
+                  {chatMessages.map(item => (
+                    <View
+                      key={item.id}
                       style={[
-                        styles.usernameHint,
-                        usernameAvailable === true
-                          ? styles.usernameHintSuccess
-                          : styles.usernameHintError,
+                        styles.chatBubble,
+                        item.role === 'user' ? styles.chatBubbleUser : styles.chatBubbleAssistant,
                       ]}
                     >
-                      {usernameHint}
-                    </Text>
-                  ) : (
-                    <Text style={styles.usernameHint}>
-                      用户名仅支持小写字母、数字和 `_.-` 组合
-                    </Text>
-                  )}
-
-                  <Text style={styles.label}>昵称（可选）</Text>
-                  <TextInput
-                    autoCapitalize="none"
-                    placeholder="请输入昵称"
-                    placeholderTextColor="#99866b"
-                    style={styles.input}
-                    value={name}
-                    onChangeText={setName}
-                  />
-
-                  <Text style={styles.label}>邮箱</Text>
-                  <TextInput
-                    autoCapitalize="none"
-                    keyboardType="email-address"
-                    placeholder="请输入邮箱地址"
-                    placeholderTextColor="#99866b"
-                    style={styles.input}
-                    value={email}
-                    onChangeText={setEmail}
-                  />
-                </>
-              )}
-
-              <Text style={styles.label}>密码</Text>
-              <TextInput
-                autoCapitalize="none"
-                autoComplete="off"
-                textContentType="oneTimeCode"
-                importantForAutofill="no"
-                autoCorrect={false}
-                spellCheck={false}
-                placeholder={mode === 'login' ? '请输入密码' : '请设置密码（至少8位）'}
-                placeholderTextColor="#99866b"
-                secureTextEntry
-                style={styles.input}
-                value={password}
-                onChangeText={setPassword}
-              />
-
-              {mode === 'register' ? (
-                <>
-                  <Text style={styles.label}>确认密码</Text>
-                  <TextInput
-                    autoCapitalize="none"
-                    autoComplete="off"
-                    textContentType="oneTimeCode"
-                    importantForAutofill="no"
-                    autoCorrect={false}
-                    spellCheck={false}
-                    placeholder="请再次输入密码"
-                    placeholderTextColor="#99866b"
-                    secureTextEntry
-                    style={styles.input}
-                    value={confirmPassword}
-                    onChangeText={setConfirmPassword}
-                  />
-                </>
-              ) : null}
-
-              <Pressable
-                style={[styles.button, (loading || registerBlocked) && styles.buttonDisabled]}
-                onPress={onSubmit}
-                disabled={loading || registerBlocked}
-              >
-                {loading ? (
-                  <ActivityIndicator color="#fff5ef" />
-                ) : (
-                  <Text style={styles.buttonText}>{mode === 'login' ? '登录' : '注册并登录'}</Text>
-                )}
-              </Pressable>
-
-              <Text style={styles.helperText}>登录后可开始你的中医养生AI对话</Text>
-            </View>
-          ) : null}
-
-          {token && !testMode ? (
-            <View style={styles.card}>
-              <Text style={styles.testHomeTitle}>欢迎回来，{currentUser?.name || '同学'}</Text>
-              <Text style={styles.testHomeDesc}>进入测试模式，读取并核验 HealthKit 全量数据。</Text>
-              <Pressable style={styles.button} onPress={() => setTestMode(true)}>
-                <Text style={styles.buttonText}>测试模式</Text>
-              </Pressable>
-            </View>
-          ) : null}
-
-          {token && testMode ? (
-            <View style={[styles.card, styles.cardExpanded]}>
-              <View style={styles.testModeHeader}>
-                <Text style={styles.testModeTitle}>测试模式</Text>
-                <Pressable style={styles.testModeBackButton} onPress={() => setTestMode(false)}>
-                  <Text style={styles.testModeBackText}>返回</Text>
-                </Pressable>
-              </View>
-
-              <Text style={styles.healthTitle}>HealthKit 全量数据读取</Text>
-              <Text style={styles.healthHint}>上方按钮用于授权与读取，读取 Mock 后自动进入可视化页面。</Text>
-
-              <View style={styles.healthActionRow}>
-                <Pressable
-                  style={[styles.healthActionButton, healthLoading && styles.buttonDisabled]}
-                  onPress={onAuthorizeHealth}
-                  disabled={healthLoading}
-                >
-                  <Text style={styles.healthActionText}>{healthLoading ? '处理中...' : '一键授权'}</Text>
-                </Pressable>
-                <Pressable
-                  style={[styles.healthActionButton, healthLoading && styles.buttonDisabled]}
-                  onPress={() => onLoadHealthData(false)}
-                  disabled={healthLoading}
-                >
-                  <Text style={styles.healthActionText}>读取真实数据</Text>
-                </Pressable>
-                <Pressable
-                  style={[
-                    styles.healthActionButton,
-                    styles.healthActionButtonSecondary,
-                    healthLoading && styles.buttonDisabled,
-                  ]}
-                  onPress={() => onLoadHealthData(true)}
-                  disabled={healthLoading}
-                >
-                  <Text style={styles.healthActionText}>读取 Mock 数据</Text>
-                </Pressable>
-              </View>
-
-              {healthAuthorized !== null ? (
-                <Text style={styles.healthStatusText}>一键授权：{healthAuthorized ? '成功' : '失败'}</Text>
-              ) : null}
-
-              {healthError ? <Text style={styles.healthError}>{healthError}</Text> : null}
-
-              {visualReady && healthSnapshot ? (
-                <ScrollView
-                  style={styles.visualScroll}
-                  contentContainerStyle={styles.visualScrollContent}
-                  showsVerticalScrollIndicator
-                >
-                  <HealthInsightsBoard snapshot={healthSnapshot} />
-                  <SnapshotRawPanel snapshot={healthSnapshot} />
+                      <Text
+                        style={[
+                          styles.chatBubbleRole,
+                          item.role === 'user'
+                            ? styles.chatBubbleRoleUser
+                            : styles.chatBubbleRoleAssistant,
+                        ]}
+                      >
+                        {item.role === 'user' ? '你' : '岐元灵术'}
+                      </Text>
+                      <Text
+                        style={[
+                          styles.chatBubbleText,
+                          item.role === 'user'
+                            ? styles.chatBubbleTextUser
+                            : styles.chatBubbleTextAssistant,
+                        ]}
+                      >
+                        {item.content}
+                      </Text>
+                      {item.role === 'assistant' && item.citations && item.citations.length > 0 ? (
+                        <View style={styles.chatCitationBox}>
+                          {item.citations.slice(0, 3).map((citation, idx) => (
+                            <Text key={`${item.id}-c-${idx}`} style={styles.chatCitationText}>
+                              {citation.label} · {citation.sourceTitle}
+                              {citation.sectionTitle ? ` · ${citation.sectionTitle}` : ''}
+                            </Text>
+                          ))}
+                        </View>
+                      ) : null}
+                    </View>
+                  ))}
                 </ScrollView>
-              ) : (
-                <View style={styles.visualPlaceholder}>
-                  <Text style={styles.visualPlaceholderText}>
-                    点击“读取 Mock 数据”后，将进入中国风健康数据可视化页面（可上下滑动）。
-                  </Text>
+
+                <View style={styles.chatComposer}>
+                  <TextInput
+                    style={styles.chatInput}
+                    value={chatInput}
+                    onChangeText={setChatInput}
+                    placeholder="输入你的问题，如：最近焦虑失眠，给我7天计划"
+                    placeholderTextColor="#9b8469"
+                    multiline
+                    editable={!chatLoading}
+                  />
+                  <Pressable
+                    style={[styles.chatSendButton, chatLoading && styles.buttonDisabled]}
+                    onPress={onSendChat}
+                    disabled={chatLoading}
+                  >
+                    <Text style={styles.chatSendText}>{chatLoading ? '等待回信...' : '发送'}</Text>
+                  </Pressable>
                 </View>
-              )}
+
+                {chatLoading ? (
+                  <View style={styles.chatLoadingOverlay}>
+                    <View style={styles.chatLoadingCard}>
+                      <Text style={styles.chatLoadingTitle}>岐元灵术正在推演方略</Text>
+                      <Text style={styles.chatLoadingSubtitle}>
+                        正在检索经典与健康数据，请稍候
+                      </Text>
+                      <ActivityIndicator color="#a7342d" style={styles.chatLoadingSpinner} />
+                    </View>
+                  </View>
+                ) : null}
+              </View>
             </View>
-          ) : null}
-        </View>
+          </View>
+        ) : (
+          <View style={[styles.content, styles.contentSpacing]}>
+            <View style={styles.titleBlock}>
+              <View style={styles.seal} />
+              <Text style={styles.cnTitle}>岐元灵术</Text>
+              <Text style={styles.enTitle}>QiAlchemy</Text>
+              <Text style={styles.subtitle}>中医养生与AI融合实验</Text>
+            </View>
+
+            {!token ? (
+              <View style={styles.card}>
+                <View style={styles.tabWrap}>
+                  <Pressable
+                    style={[styles.tabButton, mode === 'login' && styles.tabButtonActive]}
+                    onPress={() => {
+                      setMode('login');
+                      setConfirmPassword('');
+                      setUsernameChecking(false);
+                      setUsernameAvailable(null);
+                      setUsernameHint('');
+                    }}
+                  >
+                    <Text style={[styles.tabText, mode === 'login' && styles.tabTextActive]}>登录</Text>
+                  </Pressable>
+                  <Pressable
+                    style={[styles.tabButton, mode === 'register' && styles.tabButtonActive]}
+                    onPress={() => {
+                      setMode('register');
+                      setLoginId('');
+                    }}
+                  >
+                    <Text style={[styles.tabText, mode === 'register' && styles.tabTextActive]}>注册</Text>
+                  </Pressable>
+                </View>
+
+                {mode === 'login' ? (
+                  <>
+                    <Text style={styles.label}>账号</Text>
+                    <TextInput
+                      autoCapitalize="none"
+                      placeholder="请输入用户名或邮箱"
+                      placeholderTextColor="#99866b"
+                      style={styles.input}
+                      value={loginId}
+                      onChangeText={setLoginId}
+                    />
+                  </>
+                ) : (
+                  <>
+                    <Text style={styles.label}>用户名</Text>
+                    <TextInput
+                      autoCapitalize="none"
+                      placeholder="请输入用户名（3-24位）"
+                      placeholderTextColor="#99866b"
+                      style={styles.input}
+                      value={username}
+                      onChangeText={setUsername}
+                    />
+                    {usernameChecking ? (
+                      <Text style={styles.usernameHint}>正在校验用户名...</Text>
+                    ) : usernameHint ? (
+                      <Text
+                        style={[
+                          styles.usernameHint,
+                          usernameAvailable === true
+                            ? styles.usernameHintSuccess
+                            : styles.usernameHintError,
+                        ]}
+                      >
+                        {usernameHint}
+                      </Text>
+                    ) : (
+                      <Text style={styles.usernameHint}>
+                        用户名仅支持小写字母、数字和 `_.-` 组合
+                      </Text>
+                    )}
+
+                    <Text style={styles.label}>昵称（可选）</Text>
+                    <TextInput
+                      autoCapitalize="none"
+                      placeholder="请输入昵称"
+                      placeholderTextColor="#99866b"
+                      style={styles.input}
+                      value={name}
+                      onChangeText={setName}
+                    />
+
+                    <Text style={styles.label}>邮箱</Text>
+                    <TextInput
+                      autoCapitalize="none"
+                      keyboardType="email-address"
+                      placeholder="请输入邮箱地址"
+                      placeholderTextColor="#99866b"
+                      style={styles.input}
+                      value={email}
+                      onChangeText={setEmail}
+                    />
+                  </>
+                )}
+
+                <Text style={styles.label}>密码</Text>
+                <TextInput
+                  autoCapitalize="none"
+                  autoComplete="off"
+                  textContentType="oneTimeCode"
+                  importantForAutofill="no"
+                  autoCorrect={false}
+                  spellCheck={false}
+                  placeholder={mode === 'login' ? '请输入密码' : '请设置密码（至少8位）'}
+                  placeholderTextColor="#99866b"
+                  secureTextEntry
+                  style={styles.input}
+                  value={password}
+                  onChangeText={setPassword}
+                />
+
+                {mode === 'register' ? (
+                  <>
+                    <Text style={styles.label}>确认密码</Text>
+                    <TextInput
+                      autoCapitalize="none"
+                      autoComplete="off"
+                      textContentType="oneTimeCode"
+                      importantForAutofill="no"
+                      autoCorrect={false}
+                      spellCheck={false}
+                      placeholder="请再次输入密码"
+                      placeholderTextColor="#99866b"
+                      secureTextEntry
+                      style={styles.input}
+                      value={confirmPassword}
+                      onChangeText={setConfirmPassword}
+                    />
+                  </>
+                ) : null}
+
+                <Pressable
+                  style={[styles.button, (loading || registerBlocked) && styles.buttonDisabled]}
+                  onPress={onSubmit}
+                  disabled={loading || registerBlocked}
+                >
+                  {loading ? (
+                    <ActivityIndicator color="#fff5ef" />
+                  ) : (
+                    <Text style={styles.buttonText}>{mode === 'login' ? '登录' : '注册并登录'}</Text>
+                  )}
+                </Pressable>
+
+                <Text style={styles.helperText}>登录后可开始你的中医养生AI对话</Text>
+              </View>
+            ) : null}
+
+            {token && !testMode ? (
+              <View style={styles.card}>
+                <Text style={styles.testHomeTitle}>欢迎回来，{currentUser?.name || '同学'}</Text>
+                <Text style={styles.testHomeDesc}>请选择功能入口：开始聊天或进入测试模式。</Text>
+                <View style={styles.testEntryRow}>
+                  <Pressable style={[styles.button, styles.testEntryButton]} onPress={onOpenChat}>
+                    <Text style={styles.buttonText}>开始聊天</Text>
+                  </Pressable>
+                  <Pressable
+                    style={[styles.secondaryButton, styles.testEntryButton]}
+                    onPress={() => setTestMode(true)}
+                  >
+                    <Text style={styles.secondaryButtonText}>测试模式</Text>
+                  </Pressable>
+                </View>
+              </View>
+            ) : null}
+
+            {token && testMode ? (
+              <View style={[styles.card, styles.cardExpanded]}>
+                <View style={styles.testModeHeader}>
+                  <Text style={styles.testModeTitle}>测试模式</Text>
+                  <Pressable style={styles.testModeBackButton} onPress={() => setTestMode(false)}>
+                    <Text style={styles.testModeBackText}>返回</Text>
+                  </Pressable>
+                </View>
+
+                <Text style={styles.healthTitle}>HealthKit 全量数据读取</Text>
+                <Text style={styles.healthHint}>上方按钮用于授权与读取，读取 Mock 后自动进入可视化页面。</Text>
+
+                <View style={styles.healthActionRow}>
+                  <Pressable
+                    style={[styles.healthActionButton, healthLoading && styles.buttonDisabled]}
+                    onPress={onAuthorizeHealth}
+                    disabled={healthLoading}
+                  >
+                    <Text style={styles.healthActionText}>{healthLoading ? '处理中...' : '一键授权'}</Text>
+                  </Pressable>
+                  <Pressable
+                    style={[styles.healthActionButton, healthLoading && styles.buttonDisabled]}
+                    onPress={() => onLoadHealthData(false)}
+                    disabled={healthLoading}
+                  >
+                    <Text style={styles.healthActionText}>读取真实数据</Text>
+                  </Pressable>
+                  <Pressable
+                    style={[
+                      styles.healthActionButton,
+                      styles.healthActionButtonSecondary,
+                      healthLoading && styles.buttonDisabled,
+                    ]}
+                    onPress={() => onLoadHealthData(true)}
+                    disabled={healthLoading}
+                  >
+                    <Text style={styles.healthActionText}>读取 Mock 数据</Text>
+                  </Pressable>
+                </View>
+
+                {healthAuthorized !== null ? (
+                  <Text style={styles.healthStatusText}>一键授权：{healthAuthorized ? '成功' : '失败'}</Text>
+                ) : null}
+
+                {healthError ? <Text style={styles.healthError}>{healthError}</Text> : null}
+
+                {visualReady && healthSnapshot ? (
+                  <ScrollView
+                    style={styles.visualScroll}
+                    contentContainerStyle={styles.visualScrollContent}
+                    showsVerticalScrollIndicator
+                  >
+                    <HealthInsightsBoard snapshot={healthSnapshot} />
+                    <SnapshotRawPanel snapshot={healthSnapshot} />
+                  </ScrollView>
+                ) : (
+                  <View style={styles.visualPlaceholder}>
+                    <Text style={styles.visualPlaceholderText}>
+                      点击“读取 Mock 数据”后，将进入中国风健康数据可视化页面（可上下滑动）。
+                    </Text>
+                  </View>
+                )}
+              </View>
+            ) : null}
+          </View>
+        )}
       </KeyboardAvoidingView>
 
       <Modal
@@ -1080,11 +1378,221 @@ const styles = StyleSheet.create({
     fontWeight: '700',
     letterSpacing: 0.3,
   },
+  secondaryButton: {
+    marginTop: 4,
+    borderRadius: 12,
+    paddingVertical: 13,
+    alignItems: 'center',
+    borderWidth: 1,
+    borderColor: '#b13c2f',
+    backgroundColor: '#fff6f2',
+  },
+  secondaryButtonText: {
+    color: '#9b362b',
+    fontSize: 16,
+    fontWeight: '700',
+    letterSpacing: 0.3,
+  },
   helperText: {
     marginTop: 12,
     color: '#8e7659',
     fontSize: 12,
     textAlign: 'center',
+  },
+  chatFullscreen: {
+    flex: 1,
+    paddingHorizontal: 12,
+    paddingTop: 8,
+    paddingBottom: 10,
+  },
+  chatSurface: {
+    flex: 1,
+    borderWidth: 1,
+    borderColor: 'rgba(94, 62, 32, 0.2)',
+    borderRadius: 20,
+    backgroundColor: 'rgba(255, 252, 246, 0.94)',
+    paddingHorizontal: 12,
+    paddingTop: 12,
+    paddingBottom: 12,
+  },
+  chatPanel: {
+    flex: 1,
+    minHeight: 0,
+  },
+  chatHeaderRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    marginBottom: 10,
+    gap: 8,
+  },
+  chatHeaderTitle: {
+    flex: 1,
+    textAlign: 'center',
+    color: '#553b24',
+    fontSize: 18,
+    fontWeight: '700',
+    fontFamily: Platform.OS === 'ios' ? 'STKaiti' : 'serif',
+  },
+  chatHeaderButton: {
+    minWidth: 86,
+    borderWidth: 1,
+    borderColor: '#cdb28d',
+    borderRadius: 10,
+    paddingVertical: 7,
+    paddingHorizontal: 8,
+    backgroundColor: '#f8efe0',
+    alignItems: 'center',
+  },
+  chatHeaderButtonText: {
+    color: '#6f5339',
+    fontSize: 12,
+    fontWeight: '700',
+  },
+  chatSessionTag: {
+    marginBottom: 10,
+    color: '#8c7258',
+    fontSize: 12,
+  },
+  chatScroll: {
+    flex: 1,
+    minHeight: 0,
+    borderWidth: 1,
+    borderColor: 'rgba(94, 62, 32, 0.18)',
+    borderRadius: 14,
+    backgroundColor: 'rgba(255, 252, 246, 0.82)',
+  },
+  chatScrollContent: {
+    paddingHorizontal: 10,
+    paddingVertical: 12,
+    gap: 10,
+  },
+  chatBubble: {
+    borderRadius: 12,
+    paddingHorizontal: 12,
+    paddingVertical: 10,
+    borderWidth: 1,
+  },
+  chatBubbleUser: {
+    marginLeft: 42,
+    backgroundColor: '#b13c2f',
+    borderColor: '#a7342d',
+  },
+  chatBubbleAssistant: {
+    marginRight: 42,
+    backgroundColor: '#fffdf8',
+    borderColor: '#d8c4a7',
+  },
+  chatBubbleRole: {
+    marginBottom: 5,
+    fontSize: 11,
+    fontWeight: '700',
+  },
+  chatBubbleRoleUser: {
+    color: '#f8dfd8',
+  },
+  chatBubbleRoleAssistant: {
+    color: '#7f6246',
+  },
+  chatBubbleText: {
+    fontSize: 14,
+    lineHeight: 21,
+  },
+  chatBubbleTextUser: {
+    color: '#fff7f2',
+  },
+  chatBubbleTextAssistant: {
+    color: '#2f2115',
+  },
+  chatCitationBox: {
+    marginTop: 8,
+    borderTopWidth: 1,
+    borderTopColor: 'rgba(94, 62, 32, 0.18)',
+    paddingTop: 6,
+    gap: 3,
+  },
+  chatCitationText: {
+    color: '#7a6248',
+    fontSize: 11,
+    lineHeight: 16,
+  },
+  chatComposer: {
+    marginTop: 10,
+    flexDirection: 'row',
+    alignItems: 'flex-end',
+    gap: 8,
+  },
+  chatInput: {
+    flex: 1,
+    minHeight: 44,
+    maxHeight: 110,
+    borderWidth: 1,
+    borderColor: '#d8c4a7',
+    borderRadius: 12,
+    backgroundColor: '#fffdf8',
+    color: '#2f2115',
+    paddingHorizontal: 12,
+    paddingTop: 10,
+    paddingBottom: 10,
+    fontSize: 14,
+  },
+  chatSendButton: {
+    height: 44,
+    borderRadius: 12,
+    paddingHorizontal: 16,
+    alignItems: 'center',
+    justifyContent: 'center',
+    backgroundColor: '#a7342d',
+  },
+  chatSendText: {
+    color: '#fff5ef',
+    fontSize: 14,
+    fontWeight: '700',
+  },
+  chatLoadingOverlay: {
+    position: 'absolute',
+    top: 0,
+    right: 0,
+    bottom: 0,
+    left: 0,
+    backgroundColor: 'rgba(44, 25, 12, 0.26)',
+    borderRadius: 14,
+    alignItems: 'center',
+    justifyContent: 'center',
+    paddingHorizontal: 24,
+  },
+  chatLoadingCard: {
+    width: '100%',
+    borderRadius: 16,
+    borderWidth: 1,
+    borderColor: '#ceb28e',
+    backgroundColor: '#fffaf0',
+    paddingHorizontal: 18,
+    paddingVertical: 18,
+    alignItems: 'center',
+  },
+  chatLoadingTitle: {
+    color: '#4c311d',
+    fontSize: 16,
+    fontWeight: '700',
+    fontFamily: Platform.OS === 'ios' ? 'STKaiti' : 'serif',
+  },
+  chatLoadingSubtitle: {
+    marginTop: 8,
+    color: '#7a6248',
+    fontSize: 12,
+    textAlign: 'center',
+    lineHeight: 18,
+  },
+  chatLoadingSpinner: {
+    marginTop: 12,
+  },
+  testEntryRow: {
+    flexDirection: 'row',
+    gap: 10,
+  },
+  testEntryButton: {
+    flex: 1,
   },
   testHomeTitle: {
     color: '#5f4227',
