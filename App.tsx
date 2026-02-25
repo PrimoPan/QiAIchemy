@@ -1,6 +1,7 @@
-import React, { useEffect, useMemo, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   ActivityIndicator,
+  AppState,
   Alert,
   KeyboardAvoidingView,
   Modal,
@@ -53,6 +54,7 @@ type SealLogoProps = {
 };
 
 const API_BASE_URL = 'http://127.0.0.1:2818';
+const HEALTH_SYNC_INTERVAL_MS = 5 * 60 * 1000;
 const API_ERROR_MESSAGE_MAP: Record<string, string> = {
   'Email already registered': '邮箱已被注册',
   'Username already registered': '用户名已被占用',
@@ -68,6 +70,10 @@ const API_ERROR_MESSAGE_MAP: Record<string, string> = {
 const AVATAR_BG_COLORS = ['#a7342d', '#8a5d3b', '#7a4f2e', '#9c3a31', '#6c4d2f', '#8d6a45'];
 const AVATAR_BORDER_COLORS = ['#c89f74', '#b78d65', '#c39768', '#c88b79', '#b98f62', '#c6a57e'];
 const USERNAME_REGEX = /^[a-z0-9_][a-z0-9_.-]{2,23}$/;
+
+function normalizeApiBase(baseUrl = API_BASE_URL): string {
+  return baseUrl.replace(/\/+$/, '');
+}
 
 function localizeErrorMessage(message: string, fallbackMessage: string): string {
   const trimmedMessage = message.trim();
@@ -351,6 +357,11 @@ function LoginScreen(): React.JSX.Element {
   const [healthSnapshot, setHealthSnapshot] = useState<HealthSnapshot | null>(null);
   const [healthError, setHealthError] = useState('');
   const [healthAuthorized, setHealthAuthorized] = useState<boolean | null>(null);
+  const [autoHealthSyncEnabled, setAutoHealthSyncEnabled] = useState(false);
+  const [autoHealthSyncing, setAutoHealthSyncing] = useState(false);
+  const [lastHealthSyncAt, setLastHealthSyncAt] = useState<string | null>(null);
+  const [lastHealthUploadAt, setLastHealthUploadAt] = useState<string | null>(null);
+  const [lastHealthSource, setLastHealthSource] = useState<'healthkit' | 'mock' | null>(null);
   const [visualReady, setVisualReady] = useState(false);
   const [activePanel, setActivePanel] = useState<AppPanel>('home');
   const [chatInput, setChatInput] = useState('');
@@ -364,6 +375,9 @@ function LoginScreen(): React.JSX.Element {
   const [editorValue, setEditorValue] = useState('');
   const [avatarSeed, setAvatarSeed] = useState(() => Math.floor(Math.random() * 100000));
   const chatScrollRef = useRef<ScrollView | null>(null);
+  const appStateRef = useRef(AppState.currentState);
+  const healthSyncInFlightRef = useRef(false);
+  const healthSyncTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   const canUseHealth = Boolean(token);
 
@@ -413,7 +427,7 @@ function LoginScreen(): React.JSX.Element {
       };
     }
 
-    const normalizedBase = API_BASE_URL.replace(/\/+$/, '');
+    const normalizedBase = normalizeApiBase();
     const response = await fetch(
       `${normalizedBase}/api/auth/username-available?username=${encodeURIComponent(normalized)}`
     );
@@ -489,7 +503,7 @@ function LoginScreen(): React.JSX.Element {
   }, [activePanel, chatMessages.length]);
 
   const onSubmit = async () => {
-    const normalizedBase = API_BASE_URL.replace(/\/+$/, '');
+    const normalizedBase = normalizeApiBase();
 
     if (!password.trim()) {
       Alert.alert('提示', '密码不能为空');
@@ -589,6 +603,11 @@ function LoginScreen(): React.JSX.Element {
       setHealthSnapshot(null);
       setHealthError('');
       setHealthAuthorized(null);
+      setAutoHealthSyncEnabled(false);
+      setAutoHealthSyncing(false);
+      setLastHealthSyncAt(null);
+      setLastHealthUploadAt(null);
+      setLastHealthSource(null);
       setVisualReady(false);
       setActivePanel('home');
       setChatInput('');
@@ -614,7 +633,7 @@ function LoginScreen(): React.JSX.Element {
 
     setLoading(true);
     try {
-      const normalizedBase = API_BASE_URL.replace(/\/+$/, '');
+      const normalizedBase = normalizeApiBase();
       const response = await fetch(`${normalizedBase}/api/auth/me`, {
         method: 'GET',
         headers: { Authorization: `Bearer ${token}` },
@@ -641,24 +660,145 @@ function LoginScreen(): React.JSX.Element {
     }
   };
 
+  const uploadHealthSnapshotToBackend = useCallback(
+    async (snapshot: HealthSnapshot): Promise<{ uploadedAt: string }> => {
+      if (!token) {
+        throw new Error('未登录，无法上传健康快照');
+      }
+
+      const normalizedBase = normalizeApiBase();
+      const response = await fetch(`${normalizedBase}/api/health/snapshots`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify({ snapshot }),
+      });
+
+      const { data } = await readApiResponse<{ message?: string; uploadedAt?: string }>(response);
+      if (!response.ok || !data?.uploadedAt) {
+        const fallbackMessage =
+          response.status >= 500
+            ? `服务暂时不可用（HTTP ${response.status}）`
+            : `健康快照上传失败（HTTP ${response.status}）`;
+        throw new Error(localizeErrorMessage(data?.message ?? '', fallbackMessage));
+      }
+      return { uploadedAt: data.uploadedAt };
+    },
+    [token]
+  );
+
+  const syncHealthSnapshot = useCallback(
+    async ({
+      forceMock = false,
+      silent = false,
+      reason = 'manual',
+    }: {
+      forceMock?: boolean;
+      silent?: boolean;
+      reason?: 'manual' | 'auto' | 'chat';
+    }): Promise<HealthSnapshot | null> => {
+      if (!token) {
+        return null;
+      }
+
+      if (healthSyncInFlightRef.current) {
+        return null;
+      }
+      healthSyncInFlightRef.current = true;
+
+      if (!silent) {
+        setHealthLoading(true);
+      }
+      if (reason === 'auto') {
+        setAutoHealthSyncing(true);
+      }
+      setHealthError('');
+
+      try {
+        const allowMockFallback = testMode || __DEV__;
+        let snapshot: HealthSnapshot;
+
+        try {
+          snapshot = await loadHealthSnapshot(forceMock);
+        } catch (error) {
+          if (!forceMock && allowMockFallback) {
+            snapshot = await loadHealthSnapshot(true);
+          } else {
+            throw error;
+          }
+        }
+
+        setHealthSnapshot(snapshot);
+        setVisualReady(true);
+        setHealthAuthorized(Boolean(snapshot.authorized));
+        setLastHealthSource(snapshot.source);
+
+        const nowIso = new Date().toISOString();
+        setLastHealthSyncAt(nowIso);
+
+        try {
+          const uploaded = await uploadHealthSnapshotToBackend(snapshot);
+          setLastHealthUploadAt(uploaded.uploadedAt);
+        } catch (uploadError) {
+          const uploadMessage = uploadError instanceof Error ? uploadError.message : '';
+          setHealthError(localizeErrorMessage(uploadMessage, '健康数据读取成功，但上传失败'));
+        }
+
+        return snapshot;
+      } catch (error) {
+        const rawMessage = error instanceof Error ? error.message : '';
+        setHealthError(localizeErrorMessage(rawMessage, '读取健康数据失败'));
+        return null;
+      } finally {
+        healthSyncInFlightRef.current = false;
+        if (!silent) {
+          setHealthLoading(false);
+        }
+        if (reason === 'auto') {
+          setAutoHealthSyncing(false);
+        }
+      }
+    },
+    [token, testMode, uploadHealthSnapshotToBackend]
+  );
+
+  const ensureFreshHealthSnapshotForChat = useCallback(async (): Promise<HealthSnapshot | null> => {
+    if (!token) {
+      return null;
+    }
+
+    const current = healthSnapshot;
+    if (!current?.generatedAt) {
+      return syncHealthSnapshot({ silent: true, reason: 'chat' });
+    }
+
+    const generatedAtMs = new Date(current.generatedAt).getTime();
+    if (!Number.isFinite(generatedAtMs)) {
+      return syncHealthSnapshot({ silent: true, reason: 'chat' });
+    }
+
+    const ageMs = Date.now() - generatedAtMs;
+    if (ageMs >= HEALTH_SYNC_INTERVAL_MS) {
+      return syncHealthSnapshot({ silent: true, reason: 'chat' });
+    }
+
+    return current;
+  }, [token, healthSnapshot, syncHealthSnapshot]);
+
   const onLoadHealthData = async (useMock = false) => {
     if (!canUseHealth) {
       Alert.alert('提示', '请先登录后再读取健康数据');
       return;
     }
 
-    setHealthLoading(true);
-    setHealthError('');
-    try {
-      const snapshot = await loadHealthSnapshot(useMock);
-      setHealthSnapshot(snapshot);
-      setVisualReady(true);
-    } catch (error) {
-      const rawMessage = error instanceof Error ? error.message : '';
-      setHealthError(localizeErrorMessage(rawMessage, '读取健康数据失败'));
-    } finally {
-      setHealthLoading(false);
-    }
+    setAutoHealthSyncEnabled(true);
+    await syncHealthSnapshot({
+      forceMock: useMock,
+      silent: false,
+      reason: 'manual',
+    });
   };
 
   const onAuthorizeHealth = async () => {
@@ -673,8 +813,11 @@ function LoginScreen(): React.JSX.Element {
       const granted = await authorizeHealthKit();
       setHealthAuthorized(granted);
       if (!granted) {
+        setAutoHealthSyncEnabled(false);
         setHealthError('未完成授权，请检查系统健康权限设置');
       } else {
+        setAutoHealthSyncEnabled(true);
+        await syncHealthSnapshot({ forceMock: false, silent: true, reason: 'manual' });
         Alert.alert('成功', '已完成 HealthKit 一键授权');
       }
     } catch (error) {
@@ -684,6 +827,50 @@ function LoginScreen(): React.JSX.Element {
       setHealthLoading(false);
     }
   };
+
+  useEffect(() => {
+    if (!token || !autoHealthSyncEnabled) {
+      if (healthSyncTimerRef.current) {
+        clearInterval(healthSyncTimerRef.current);
+        healthSyncTimerRef.current = null;
+      }
+      setAutoHealthSyncing(false);
+      return;
+    }
+
+    const runAutoSync = async () => {
+      await syncHealthSnapshot({ forceMock: false, silent: true, reason: 'auto' });
+    };
+
+    runAutoSync();
+    healthSyncTimerRef.current = setInterval(runAutoSync, HEALTH_SYNC_INTERVAL_MS);
+
+    return () => {
+      if (healthSyncTimerRef.current) {
+        clearInterval(healthSyncTimerRef.current);
+        healthSyncTimerRef.current = null;
+      }
+      setAutoHealthSyncing(false);
+    };
+  }, [token, autoHealthSyncEnabled, syncHealthSnapshot]);
+
+  useEffect(() => {
+    if (!token || !autoHealthSyncEnabled) {
+      return;
+    }
+
+    const subscription = AppState.addEventListener('change', nextState => {
+      const prevState = appStateRef.current;
+      appStateRef.current = nextState;
+      if ((prevState === 'background' || prevState === 'inactive') && nextState === 'active') {
+        void syncHealthSnapshot({ forceMock: false, silent: true, reason: 'auto' });
+      }
+    });
+
+    return () => {
+      subscription.remove();
+    };
+  }, [token, autoHealthSyncEnabled, syncHealthSnapshot]);
 
   const onOpenChat = () => {
     if (!token) {
@@ -709,7 +896,7 @@ function LoginScreen(): React.JSX.Element {
       return;
     }
 
-    const normalizedBase = API_BASE_URL.replace(/\/+$/, '');
+    const normalizedBase = normalizeApiBase();
     const userMessage: ChatMessage = {
       id: createMessageId(),
       role: 'user',
@@ -724,6 +911,8 @@ function LoginScreen(): React.JSX.Element {
     setChatMessages(prev => [...prev, userMessage]);
     setChatLoading(true);
     try {
+      const latestSnapshotForChat = await ensureFreshHealthSnapshotForChat();
+
       const response = await fetch(`${normalizedBase}/api/agent/chat/health`, {
         method: 'POST',
         headers: {
@@ -734,6 +923,7 @@ function LoginScreen(): React.JSX.Element {
           message: question,
           topK: 6,
           history: previousTurns,
+          latestHealthSnapshot: latestSnapshotForChat ?? undefined,
         }),
       });
 
@@ -786,6 +976,11 @@ function LoginScreen(): React.JSX.Element {
   };
 
   const onLogout = () => {
+    if (healthSyncTimerRef.current) {
+      clearInterval(healthSyncTimerRef.current);
+      healthSyncTimerRef.current = null;
+    }
+    healthSyncInFlightRef.current = false;
     setToken('');
     setCurrentUser(null);
     setLoginId('');
@@ -800,6 +995,11 @@ function LoginScreen(): React.JSX.Element {
     setHealthSnapshot(null);
     setHealthError('');
     setHealthAuthorized(null);
+    setAutoHealthSyncEnabled(false);
+    setAutoHealthSyncing(false);
+    setLastHealthSyncAt(null);
+    setLastHealthUploadAt(null);
+    setLastHealthSource(null);
     setVisualReady(false);
     setTestMode(false);
     setActivePanel('home');
@@ -1220,6 +1420,24 @@ function LoginScreen(): React.JSX.Element {
 
                 {healthAuthorized !== null ? (
                   <Text style={styles.healthStatusText}>一键授权：{healthAuthorized ? '成功' : '失败'}</Text>
+                ) : null}
+
+                <Text style={styles.healthStatusText}>
+                  自动采集上传（每5分钟）：{autoHealthSyncEnabled ? '已开启' : '未开启'}
+                </Text>
+                <Text style={styles.healthStatusText}>
+                  自动任务状态：{autoHealthSyncing ? '同步中' : '空闲'}
+                </Text>
+                {lastHealthSyncAt ? (
+                  <Text style={styles.healthStatusText}>
+                    最近采集：{formatDateLabel(lastHealthSyncAt)}（
+                    {lastHealthSource === 'healthkit' ? 'HealthKit' : 'Mock'}）
+                  </Text>
+                ) : null}
+                {lastHealthUploadAt ? (
+                  <Text style={styles.healthStatusText}>
+                    最近上传：{formatDateLabel(lastHealthUploadAt)}
+                  </Text>
                 ) : null}
 
                 {healthError ? <Text style={styles.healthError}>{healthError}</Text> : null}
