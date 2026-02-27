@@ -80,10 +80,13 @@ export type HealthActivityData = {
   stepsToday?: number;
   distanceWalkingRunningKmToday?: number;
   activeEnergyKcalToday?: number;
+  activeEnergyGoalKcal?: number;
   basalEnergyKcalToday?: number;
   flightsClimbedToday?: number;
   exerciseMinutesToday?: number;
+  exerciseGoalMinutes?: number;
   standHoursToday?: number;
+  standGoalHours?: number;
   stepsHourlySeriesToday?: HealthTrendPoint[];
   activeEnergyHourlySeriesToday?: HealthTrendPoint[];
   exerciseMinutesHourlySeriesToday?: HealthTrendPoint[];
@@ -163,6 +166,22 @@ type NativeHealthKitManager = {
 const { HealthKitManager } = NativeModules as {
   HealthKitManager?: NativeHealthKitManager;
 };
+
+async function withTimeout<T>(promise: Promise<T>, timeoutMs: number, message: string): Promise<T> {
+  let timeoutId: ReturnType<typeof setTimeout> | null = null;
+  try {
+    const timeoutPromise = new Promise<T>((_, reject) => {
+      timeoutId = setTimeout(() => {
+        reject(new Error(message));
+      }, timeoutMs);
+    });
+    return await Promise.race([promise, timeoutPromise]);
+  } finally {
+    if (timeoutId) {
+      clearTimeout(timeoutId);
+    }
+  }
+}
 
 function randomInt(min: number, max: number): number {
   return Math.floor(Math.random() * (max - min + 1)) + min;
@@ -275,10 +294,13 @@ function buildMockActivityData(now: Date): HealthActivityData {
     stepsToday,
     distanceWalkingRunningKmToday,
     activeEnergyKcalToday,
+    activeEnergyGoalKcal: 600,
     basalEnergyKcalToday: randomInt(1180, 1920),
     flightsClimbedToday: randomInt(0, 20),
     exerciseMinutesToday,
+    exerciseGoalMinutes: 45,
     standHoursToday,
+    standGoalHours: 12,
     stepsHourlySeriesToday,
     activeEnergyHourlySeriesToday,
     exerciseMinutesHourlySeriesToday,
@@ -643,40 +665,58 @@ export async function loadHealthSnapshot(useMock = false): Promise<HealthKitAllD
   }
 
   if (!HealthKitManager) {
-    return {
-      ...buildMockSnapshot(),
-      note: 'HealthKit native module is unavailable, fallback to mock data',
-    };
+    throw new Error('HealthKit 原生模块不可用，请确认 iOS 工程已正确集成');
   }
 
-  const isAvailable = await HealthKitManager.isHealthDataAvailable();
+  const isAvailable = await withTimeout(
+    HealthKitManager.isHealthDataAvailable(),
+    5000,
+    'HealthKit 可用性检查超时，请重试'
+  );
   if (!isAvailable) {
-    return {
-      ...buildMockSnapshot(),
-      source: 'mock',
-      authorized: false,
-      note: 'Health data is unavailable on this device',
-    };
+    throw new Error('当前设备不支持 HealthKit 数据读取');
   }
 
-  const authorized = await HealthKitManager.requestAuthorization();
+  const authorized = await withTimeout(
+    HealthKitManager.requestAuthorization(),
+    15000,
+    'HealthKit 授权超时，请在系统设置中确认后重试'
+  );
   if (!authorized) {
     throw new Error('未授予健康数据读取权限');
   }
 
-  const nativeSnapshot = await HealthKitManager.getHealthSnapshot();
-  return {
-    source: 'healthkit',
-    authorized: Boolean(nativeSnapshot?.authorized ?? true),
-    generatedAt: nativeSnapshot?.generatedAt ?? new Date().toISOString(),
-    note: nativeSnapshot?.note,
-    activity: nativeSnapshot?.activity,
-    sleep: nativeSnapshot?.sleep,
-    heart: nativeSnapshot?.heart,
-    oxygen: nativeSnapshot?.oxygen,
-    metabolic: nativeSnapshot?.metabolic,
-    environment: nativeSnapshot?.environment,
-    body: nativeSnapshot?.body,
-    workouts: nativeSnapshot?.workouts ?? [],
-  };
+  try {
+    const nativeSnapshot = await withTimeout(
+      HealthKitManager.getHealthSnapshot(),
+      25000,
+      'HealthKit 数据读取超时，请稍后重试'
+    );
+    return {
+      source: 'healthkit',
+      authorized: Boolean(nativeSnapshot?.authorized ?? true),
+      generatedAt: nativeSnapshot?.generatedAt ?? new Date().toISOString(),
+      note: nativeSnapshot?.note,
+      activity: nativeSnapshot?.activity,
+      sleep: nativeSnapshot?.sleep,
+      heart: nativeSnapshot?.heart,
+      oxygen: nativeSnapshot?.oxygen,
+      metabolic: nativeSnapshot?.metabolic,
+      environment: nativeSnapshot?.environment,
+      body: nativeSnapshot?.body,
+      workouts: nativeSnapshot?.workouts ?? [],
+    };
+  } catch (error) {
+    const rawMessage = error instanceof Error ? error.message : String(error ?? '');
+    if (/no data available for the specified predicate/i.test(rawMessage)) {
+      return {
+        source: 'healthkit',
+        authorized: true,
+        generatedAt: new Date().toISOString(),
+        note: '部分健康指标在当前时间范围暂无数据，已返回可用数据字段',
+        workouts: [],
+      };
+    }
+    throw error;
+  }
 }

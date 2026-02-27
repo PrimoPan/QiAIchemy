@@ -278,12 +278,18 @@ function SegmentedRing({
 
 function TaijiRings({
   moveKcal,
+  moveGoalKcal,
   exerciseMin,
+  exerciseGoalMin,
   standHours,
+  standGoalHours,
 }: {
   moveKcal: number;
+  moveGoalKcal: number;
   exerciseMin: number;
+  exerciseGoalMin: number;
   standHours: number;
+  standGoalHours: number;
 }) {
   const size = 228;
   const center = size / 2;
@@ -293,7 +299,7 @@ function TaijiRings({
     {
       label: '行气环',
       value: moveKcal,
-      target: 480,
+      target: moveGoalKcal,
       unit: 'kcal',
       color: '#b53f33',
       trackColor: '#ead2c5',
@@ -304,7 +310,7 @@ function TaijiRings({
     {
       label: '强身环',
       value: exerciseMin,
-      target: 45,
+      target: exerciseGoalMin,
       unit: 'min',
       color: '#bc7d42',
       trackColor: '#efe0cd',
@@ -315,7 +321,7 @@ function TaijiRings({
     {
       label: '立身环',
       value: standHours,
-      target: 12,
+      target: standGoalHours,
       unit: 'h',
       color: '#6f5339',
       trackColor: '#e8dccf',
@@ -605,8 +611,11 @@ export function HealthInsightsBoard({ snapshot }: HealthInsightsBoardProps): Rea
         </Text>
         <TaijiRings
           moveKcal={snapshot.activity?.activeEnergyKcalToday ?? 0}
+          moveGoalKcal={snapshot.activity?.activeEnergyGoalKcal ?? 480}
           exerciseMin={snapshot.activity?.exerciseMinutesToday ?? 0}
+          exerciseGoalMin={snapshot.activity?.exerciseGoalMinutes ?? 45}
           standHours={snapshot.activity?.standHoursToday ?? 0}
+          standGoalHours={snapshot.activity?.standGoalHours ?? 12}
         />
       </View>
 

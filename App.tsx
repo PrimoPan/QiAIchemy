@@ -9,6 +9,7 @@ import {
   Pressable,
   SafeAreaView,
   ScrollView,
+  Settings,
   StatusBar,
   StyleSheet,
   Text,
@@ -74,10 +75,15 @@ type SealLogoProps = {
   style?: object;
 };
 
-const API_BASE_URL = 'http://127.0.0.1:2818';
+const API_BASE_URL = 'http://43.138.212.17:2818';
 const HEALTH_SYNC_INTERVAL_MS = 5 * 60 * 1000;
 // Temporary switch: mute 5-minute auto sync/upload while validating iOS HealthKit reads.
 const MUTE_AUTO_HEALTH_SYNC = true;
+// Temporary switch: mute health snapshot POST to backend to avoid server pressure.
+const MUTE_HEALTH_SNAPSHOT_POST = true;
+const REMEMBER_LOGIN_SETTINGS_KEY = 'qialchemy.rememberLogin.enabled';
+const REMEMBER_LOGIN_ID_SETTINGS_KEY = 'qialchemy.rememberLogin.id';
+const REMEMBER_PASSWORD_SETTINGS_KEY = 'qialchemy.rememberLogin.password';
 const API_ERROR_MESSAGE_MAP: Record<string, string> = {
   'Email already registered': '邮箱已被注册',
   'Username already registered': '用户名已被占用',
@@ -120,6 +126,10 @@ function localizeErrorMessage(message: string, fallbackMessage: string): string 
 
   if (normalized.includes('json parse error')) {
     return '服务返回格式异常，请检查后端网关';
+  }
+
+  if (normalized.includes('no data available for the specified predicate')) {
+    return '当前时间范围暂无可读健康样本，请先在健康App中产生记录后重试';
   }
 
   return trimmedMessage;
@@ -282,7 +292,7 @@ function SnapshotRawPanel({ snapshot }: { snapshot: HealthSnapshot }): React.JSX
     {
       label: '活动趋势点',
       value: `${snapshot.activity?.stepsHourlySeriesToday?.length ?? 0} / ${snapshot.activity?.activeEnergyHourlySeriesToday?.length ?? 0} / ${snapshot.activity?.exerciseMinutesHourlySeriesToday?.length ?? 0}`,
-      note: '步数/活动能量/运动分钟',
+      note: `步数/活动能量/运动分钟 · 圆环目标 Move ${formatMetric(snapshot.activity?.activeEnergyGoalKcal)} kcal / Exercise ${formatMetric(snapshot.activity?.exerciseGoalMinutes)} min / Stand ${formatMetric(snapshot.activity?.standGoalHours)} h`,
     },
     {
       label: '睡眠样本',
@@ -351,6 +361,46 @@ function SnapshotRawPanel({ snapshot }: { snapshot: HealthSnapshot }): React.JSX
   );
 }
 
+function readRememberedLogin(): { enabled: boolean; loginId: string; password: string } {
+  if (Platform.OS !== 'ios') {
+    return { enabled: false, loginId: '', password: '' };
+  }
+
+  const rawEnabled = Settings.get(REMEMBER_LOGIN_SETTINGS_KEY);
+  const enabled =
+    rawEnabled === undefined || rawEnabled === null ? true : !(rawEnabled === false || rawEnabled === 'false');
+
+  const rawLoginId = Settings.get(REMEMBER_LOGIN_ID_SETTINGS_KEY);
+  const rawPassword = Settings.get(REMEMBER_PASSWORD_SETTINGS_KEY);
+
+  return {
+    enabled,
+    loginId: typeof rawLoginId === 'string' ? rawLoginId : '',
+    password: typeof rawPassword === 'string' ? rawPassword : '',
+  };
+}
+
+function persistRememberedLogin(enabled: boolean, loginId = '', password = ''): void {
+  if (Platform.OS !== 'ios') {
+    return;
+  }
+
+  if (!enabled) {
+    Settings.set({
+      [REMEMBER_LOGIN_SETTINGS_KEY]: false,
+      [REMEMBER_LOGIN_ID_SETTINGS_KEY]: '',
+      [REMEMBER_PASSWORD_SETTINGS_KEY]: '',
+    });
+    return;
+  }
+
+  Settings.set({
+    [REMEMBER_LOGIN_SETTINGS_KEY]: true,
+    [REMEMBER_LOGIN_ID_SETTINGS_KEY]: loginId.trim(),
+    [REMEMBER_PASSWORD_SETTINGS_KEY]: password,
+  });
+}
+
 function App(): React.JSX.Element {
   return (
     <SafeAreaView style={styles.screen}>
@@ -361,12 +411,14 @@ function App(): React.JSX.Element {
 }
 
 function LoginScreen(): React.JSX.Element {
+  const rememberedLoginAtLaunch = useMemo(() => readRememberedLogin(), []);
   const [mode, setMode] = useState<AuthMode>('login');
-  const [loginId, setLoginId] = useState('');
+  const [rememberCredentials, setRememberCredentials] = useState(rememberedLoginAtLaunch.enabled);
+  const [loginId, setLoginId] = useState(rememberedLoginAtLaunch.loginId);
   const [username, setUsername] = useState('');
   const [name, setName] = useState('');
   const [email, setEmail] = useState('');
-  const [password, setPassword] = useState('');
+  const [password, setPassword] = useState(rememberedLoginAtLaunch.password);
   const [confirmPassword, setConfirmPassword] = useState('');
   const [usernameChecking, setUsernameChecking] = useState(false);
   const [usernameAvailable, setUsernameAvailable] = useState<boolean | null>(null);
@@ -731,9 +783,14 @@ function LoginScreen(): React.JSX.Element {
       setCurrentUser(data.user);
       setAvatarSeed(Math.floor(Math.random() * 100000));
 
-      setPassword('');
+      const loginIdToRemember =
+        mode === 'login' ? normalizedLoginId : normalizedUsername || normalizedEmail;
+      const passwordToRemember = password.trim();
+      persistRememberedLogin(rememberCredentials, loginIdToRemember, passwordToRemember);
+
+      setPassword(rememberCredentials ? passwordToRemember : '');
       setConfirmPassword('');
-      setLoginId('');
+      setLoginId(rememberCredentials ? loginIdToRemember : '');
       setUsername('');
       setEmail('');
       setTestMode(false);
@@ -941,18 +998,7 @@ function LoginScreen(): React.JSX.Element {
       setHealthError('');
 
       try {
-        const allowMockFallback = testMode || __DEV__;
-        let snapshot: HealthSnapshot;
-
-        try {
-          snapshot = await loadHealthSnapshot(forceMock);
-        } catch (error) {
-          if (!forceMock && allowMockFallback) {
-            snapshot = await loadHealthSnapshot(true);
-          } else {
-            throw error;
-          }
-        }
+        const snapshot = await loadHealthSnapshot(forceMock);
 
         setHealthSnapshot(snapshot);
         setVisualReady(true);
@@ -962,13 +1008,17 @@ function LoginScreen(): React.JSX.Element {
         const nowIso = new Date().toISOString();
         setLastHealthSyncAt(nowIso);
 
-        try {
-          const uploaded = await uploadHealthSnapshotToBackend(snapshot);
-          setLastHealthUploadAt(uploaded.uploadedAt);
-          await handleRiskAlerts(uploaded.alerts ?? []);
-        } catch (uploadError) {
-          const uploadMessage = uploadError instanceof Error ? uploadError.message : '';
-          setHealthError(localizeErrorMessage(uploadMessage, '健康数据读取成功，但上传失败'));
+        if (MUTE_HEALTH_SNAPSHOT_POST) {
+          setLastHealthUploadAt(null);
+        } else {
+          try {
+            const uploaded = await uploadHealthSnapshotToBackend(snapshot);
+            setLastHealthUploadAt(uploaded.uploadedAt);
+            await handleRiskAlerts(uploaded.alerts ?? []);
+          } catch (uploadError) {
+            const uploadMessage = uploadError instanceof Error ? uploadError.message : '';
+            setHealthError(localizeErrorMessage(uploadMessage, '健康数据读取成功，但上传失败'));
+          }
         }
 
         return snapshot;
@@ -986,7 +1036,7 @@ function LoginScreen(): React.JSX.Element {
         }
       }
     },
-    [token, testMode, uploadHealthSnapshotToBackend, handleRiskAlerts]
+    [token, uploadHealthSnapshotToBackend, handleRiskAlerts]
   );
 
   const ensureFreshHealthSnapshotForChat = useCallback(async (): Promise<HealthSnapshot | null> => {
@@ -1019,7 +1069,7 @@ function LoginScreen(): React.JSX.Element {
     }
 
     setAutoHealthSyncEnabled(!MUTE_AUTO_HEALTH_SYNC);
-    await ensureRiskAlertPermission();
+    void ensureRiskAlertPermission();
     await syncHealthSnapshot({
       forceMock: useMock,
       silent: false,
@@ -1043,7 +1093,7 @@ function LoginScreen(): React.JSX.Element {
         setHealthError('未完成授权，请检查系统健康权限设置');
       } else {
         setAutoHealthSyncEnabled(!MUTE_AUTO_HEALTH_SYNC);
-        await ensureRiskAlertPermission();
+        void ensureRiskAlertPermission();
         await syncHealthSnapshot({ forceMock: false, silent: true, reason: 'manual' });
         Alert.alert('成功', '已完成 HealthKit 一键授权');
       }
@@ -1225,13 +1275,15 @@ function LoginScreen(): React.JSX.Element {
       healthSyncTimerRef.current = null;
     }
     healthSyncInFlightRef.current = false;
+    const rememberedLogin = readRememberedLogin();
     setToken('');
     setCurrentUser(null);
-    setLoginId('');
+    setLoginId(rememberedLogin.enabled ? rememberedLogin.loginId : '');
     setUsername('');
     setEmail('');
     setName('');
-    setPassword('');
+    setPassword(rememberedLogin.enabled ? rememberedLogin.password : '');
+    setRememberCredentials(rememberedLogin.enabled);
     setConfirmPassword('');
     setUsernameChecking(false);
     setUsernameAvailable(null);
@@ -1259,6 +1311,14 @@ function LoginScreen(): React.JSX.Element {
     setEditorVisible(false);
     setMode('login');
   };
+
+  const onToggleRememberCredentials = useCallback(() => {
+    setRememberCredentials(prev => {
+      const next = !prev;
+      persistRememberedLogin(next, loginId, password);
+      return next;
+    });
+  }, [loginId, password]);
 
   const openNicknameEditor = () => {
     setEditorMode('name');
@@ -1647,6 +1707,20 @@ function LoginScreen(): React.JSX.Element {
                   onChangeText={setPassword}
                 />
 
+                {mode === 'login' ? (
+                  <Pressable style={styles.rememberRow} onPress={onToggleRememberCredentials}>
+                    <View
+                      style={[
+                        styles.rememberCheckbox,
+                        rememberCredentials && styles.rememberCheckboxChecked,
+                      ]}
+                    >
+                      {rememberCredentials ? <Text style={styles.rememberCheckmark}>✓</Text> : null}
+                    </View>
+                    <Text style={styles.rememberText}>记住账号和密码</Text>
+                  </Pressable>
+                ) : null}
+
                 {mode === 'register' ? (
                   <>
                     <Text style={styles.label}>确认密码</Text>
@@ -1748,6 +1822,9 @@ function LoginScreen(): React.JSX.Element {
                 <Text style={styles.healthStatusText}>
                   自动采集上传（每5分钟）：
                   {MUTE_AUTO_HEALTH_SYNC ? '已静音（保留代码）' : autoHealthSyncEnabled ? '已开启' : '未开启'}
+                </Text>
+                <Text style={styles.healthStatusText}>
+                  健康快照上传：{MUTE_HEALTH_SNAPSHOT_POST ? '已静音（不向后端POST）' : '已开启'}
                 </Text>
                 <Text style={styles.healthStatusText}>
                   风险弹窗权限：
@@ -2005,6 +2082,38 @@ const styles = StyleSheet.create({
     color: '#2f2115',
     marginBottom: 16,
     backgroundColor: '#fffdf8',
+  },
+  rememberRow: {
+    marginTop: -8,
+    marginBottom: 14,
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+  },
+  rememberCheckbox: {
+    width: 18,
+    height: 18,
+    borderRadius: 5,
+    borderWidth: 1,
+    borderColor: '#c9b395',
+    backgroundColor: '#fffdf8',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  rememberCheckboxChecked: {
+    borderColor: '#a7342d',
+    backgroundColor: '#a7342d',
+  },
+  rememberCheckmark: {
+    color: '#fff8f1',
+    fontSize: 12,
+    fontWeight: '700',
+    lineHeight: 12,
+  },
+  rememberText: {
+    color: '#75583a',
+    fontSize: 13,
+    fontWeight: '500',
   },
   usernameHint: {
     marginTop: -10,

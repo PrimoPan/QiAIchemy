@@ -77,6 +77,9 @@ class HealthKitManager: NSObject {
       guard let error else {
         return
       }
+      if self.isNoDataError(error) {
+        return
+      }
       self.lock.lock()
       if queryError == nil {
         queryError = error
@@ -94,6 +97,9 @@ class HealthKitManager: NSObject {
       guard let value else {
         return
       }
+      guard value.isFinite else {
+        return
+      }
       self.lock.lock()
       var dict = sections[section] ?? [:]
       dict[key] = Self.round(value)
@@ -107,7 +113,12 @@ class HealthKitManager: NSObject {
       }
       self.lock.lock()
       var dict = sections[section] ?? [:]
-      dict.merge(values) { _, new in new }
+      values.forEach { key, raw in
+        guard Self.isBridgeSafeValue(raw) else {
+          return
+        }
+        dict[key] = raw
+      }
       sections[section] = dict
       self.lock.unlock()
     }
@@ -181,6 +192,19 @@ class HealthKitManager: NSObject {
       setErrorIfNeeded(error)
       setSectionValue(section: "activity", key: "standHoursToday", value: value)
       dispatchGroup.leave()
+    }
+
+    if #available(iOS 9.3, *) {
+      dispatchGroup.enter()
+      queryTodayActivityGoals { summary, error in
+        setErrorIfNeeded(error)
+        if let summary {
+          mergeSection(section: "activity", values: summary)
+        } else {
+          appendNote("activitySummary goals unavailable, using client fallback goals")
+        }
+        dispatchGroup.leave()
+      }
     }
 
     if #available(iOS 17.0, *) {
@@ -344,6 +368,10 @@ class HealthKitManager: NSObject {
 
   private func buildReadTypes() -> Set<HKObjectType> {
     var readTypes: Set<HKObjectType> = [HKObjectType.workoutType()]
+
+    if #available(iOS 9.3, *) {
+      readTypes.insert(HKObjectType.activitySummaryType())
+    }
 
     let quantityIdentifiers: [HKQuantityTypeIdentifier] = [
       .stepCount,
@@ -605,6 +633,52 @@ class HealthKitManager: NSObject {
     healthStore.execute(query)
   }
 
+  private func queryTodayActivityGoals(completion: @escaping ([String: Any]?, Error?) -> Void) {
+    if #available(iOS 9.3, *) {
+      let calendar = Calendar.current
+      let startDate = calendar.startOfDay(for: Date())
+      guard let endDate = calendar.date(byAdding: .day, value: 1, to: startDate) else {
+        completion(nil, nil)
+        return
+      }
+      let startComponents = calendar.dateComponents([.year, .month, .day], from: startDate)
+      let endComponents = calendar.dateComponents([.year, .month, .day], from: endDate)
+      let predicate = HKQuery.predicate(
+        forActivitySummariesBetweenStart: startComponents,
+        end: endComponents
+      )
+
+      let query = HKActivitySummaryQuery(predicate: predicate) { _, summaries, error in
+        if let error {
+          completion(nil, error)
+          return
+        }
+
+        guard let summary = summaries?.first else {
+          completion(nil, nil)
+          return
+        }
+
+        let moveGoal = summary.activeEnergyBurnedGoal.doubleValue(for: HKUnit.kilocalorie())
+        let exerciseGoal = summary.appleExerciseTimeGoal.doubleValue(for: HKUnit.minute())
+        let standGoal = summary.appleStandHoursGoal.doubleValue(for: HKUnit.count())
+
+        completion(
+          [
+            "activeEnergyGoalKcal": Self.round(moveGoal),
+            "exerciseGoalMinutes": Self.round(exerciseGoal),
+            "standGoalHours": Self.round(standGoal),
+          ],
+          nil
+        )
+      }
+
+      healthStore.execute(query)
+    } else {
+      completion(nil, nil)
+    }
+  }
+
   private func querySleepApneaSummaryLast30Days(completion: @escaping ([String: Any]?, Error?) -> Void) {
     if #available(iOS 18.0, *) {
       let apneaIdentifier = HKCategoryTypeIdentifier(
@@ -817,13 +891,46 @@ class HealthKitManager: NSObject {
   }
 
   private static func round(_ value: Double, digits: Int = 2) -> Double {
+    guard value.isFinite else {
+      return 0
+    }
     let factor = pow(10.0, Double(digits))
     return Darwin.round(value * factor) / factor
+  }
+
+  private static func isBridgeSafeValue(_ value: Any) -> Bool {
+    if let number = value as? NSNumber {
+      if CFGetTypeID(number) == CFBooleanGetTypeID() {
+        return true
+      }
+      return number.doubleValue.isFinite
+    }
+    if let doubleValue = value as? Double {
+      return doubleValue.isFinite
+    }
+    if let floatValue = value as? Float {
+      return floatValue.isFinite
+    }
+    return true
   }
 
   private static func isoString(from date: Date) -> String {
     let formatter = ISO8601DateFormatter()
     formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
     return formatter.string(from: date)
+  }
+
+  private func isNoDataError(_ error: Error) -> Bool {
+    let nsError = error as NSError
+    if nsError.domain == HKErrorDomain, nsError.code == HKError.Code.errorNoData.rawValue {
+      return true
+    }
+
+    let message = nsError.localizedDescription.lowercased()
+    if message.contains("no data available for the specified predicate") {
+      return true
+    }
+
+    return false
   }
 }
