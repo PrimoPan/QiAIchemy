@@ -75,11 +75,15 @@ type SealLogoProps = {
 };
 
 const API_BASE_URL = 'http://43.138.212.17:2818';
-const HEALTH_SYNC_INTERVAL_MS = 5 * 60 * 1000;
-// Temporary switch: mute 5-minute auto sync/upload while validating iOS HealthKit reads.
-const MUTE_AUTO_HEALTH_SYNC = true;
-// Temporary switch: mute health snapshot POST to backend to avoid server pressure.
-const MUTE_HEALTH_SNAPSHOT_POST = true;
+const HEALTH_SYNC_INTERVAL_MS = 10 * 60 * 1000;
+const AUTO_HEALTH_SYNC_INITIAL_DELAY_MS = 12 * 1000;
+const AUTO_HEALTH_SYNC_JITTER_MS = 90 * 1000;
+const AUTO_UPLOAD_RETRY_DEDUP_MS = 2 * 60 * 1000;
+const AUTO_UPLOAD_SERIES_LIMIT = 48;
+const AUTO_UPLOAD_SLEEP_SAMPLES_LIMIT = 80;
+const MUTE_AUTO_HEALTH_SYNC = false;
+const MUTE_HEALTH_SNAPSHOT_POST = false;
+const SHOW_HEALTH_RAW_PANEL = false;
 // Debug switch: print full health snapshot JSON after each successful read.
 const LOG_HEALTH_SNAPSHOT_JSON = true;
 const REMEMBER_LOGIN_SETTINGS_KEY = 'qialchemy.rememberLogin.enabled';
@@ -197,6 +201,159 @@ function glucoseStatusZh(valueMmolL: number | undefined): string {
     return '偏低';
   }
   return '正常范围';
+}
+
+function truncateSeries(points: Array<{ timestamp: string; value: number; unit: string }> | undefined, limit: number) {
+  if (!points || points.length <= limit) {
+    return points;
+  }
+  return points.slice(points.length - limit);
+}
+
+function truncateWorkouts(workouts: HealthWorkoutRecord[] | undefined, limit: number): HealthWorkoutRecord[] | undefined {
+  if (!workouts || workouts.length <= limit) {
+    return workouts;
+  }
+  return workouts.slice(0, limit);
+}
+
+function compactSnapshotForAutoUpload(snapshot: HealthSnapshot): HealthSnapshot {
+  return {
+    ...snapshot,
+    activity: snapshot.activity
+      ? {
+          ...snapshot.activity,
+          stepsHourlySeriesToday: truncateSeries(snapshot.activity.stepsHourlySeriesToday, AUTO_UPLOAD_SERIES_LIMIT),
+          activeEnergyHourlySeriesToday: truncateSeries(
+            snapshot.activity.activeEnergyHourlySeriesToday,
+            AUTO_UPLOAD_SERIES_LIMIT
+          ),
+          exerciseMinutesHourlySeriesToday: truncateSeries(
+            snapshot.activity.exerciseMinutesHourlySeriesToday,
+            AUTO_UPLOAD_SERIES_LIMIT
+          ),
+        }
+      : undefined,
+    sleep: snapshot.sleep
+      ? {
+          ...snapshot.sleep,
+          samplesLast36h: snapshot.sleep.samplesLast36h?.slice(-AUTO_UPLOAD_SLEEP_SAMPLES_LIMIT),
+        }
+      : undefined,
+    heart: snapshot.heart
+      ? {
+          ...snapshot.heart,
+          heartRateSeriesLast24h: truncateSeries(snapshot.heart.heartRateSeriesLast24h, AUTO_UPLOAD_SERIES_LIMIT),
+          heartRateVariabilitySeriesLast7d: truncateSeries(
+            snapshot.heart.heartRateVariabilitySeriesLast7d,
+            AUTO_UPLOAD_SERIES_LIMIT
+          ),
+        }
+      : undefined,
+    oxygen: snapshot.oxygen
+      ? {
+          ...snapshot.oxygen,
+          bloodOxygenSeriesLast24h: truncateSeries(snapshot.oxygen.bloodOxygenSeriesLast24h, AUTO_UPLOAD_SERIES_LIMIT),
+        }
+      : undefined,
+    metabolic: snapshot.metabolic
+      ? {
+          ...snapshot.metabolic,
+          bloodGlucoseSeriesLast7d: truncateSeries(snapshot.metabolic.bloodGlucoseSeriesLast7d, AUTO_UPLOAD_SERIES_LIMIT),
+        }
+      : undefined,
+    environment: snapshot.environment
+      ? {
+          ...snapshot.environment,
+          daylightSeriesLast7d: truncateSeries(snapshot.environment.daylightSeriesLast7d, AUTO_UPLOAD_SERIES_LIMIT),
+        }
+      : undefined,
+    body: snapshot.body
+      ? {
+          ...snapshot.body,
+          respiratoryRateSeriesLast7d: truncateSeries(snapshot.body.respiratoryRateSeriesLast7d, AUTO_UPLOAD_SERIES_LIMIT),
+          bodyTemperatureSeriesLast7d: truncateSeries(
+            snapshot.body.bodyTemperatureSeriesLast7d,
+            AUTO_UPLOAD_SERIES_LIMIT
+          ),
+          bodyMassSeriesLast30d: truncateSeries(snapshot.body.bodyMassSeriesLast30d, AUTO_UPLOAD_SERIES_LIMIT),
+        }
+      : undefined,
+    workouts: truncateWorkouts(snapshot.workouts, 8),
+  };
+}
+
+function buildUploadDedupKey(snapshot: HealthSnapshot): string {
+  return [
+    snapshot.source,
+    snapshot.generatedAt,
+    snapshot.activity?.stepsToday ?? '-',
+    snapshot.activity?.activeEnergyKcalToday ?? '-',
+    snapshot.activity?.exerciseMinutesToday ?? '-',
+    snapshot.sleep?.sleepScore ?? '-',
+    snapshot.sleep?.asleepMinutesLast36h ?? '-',
+    snapshot.heart?.latestHeartRateBpm ?? '-',
+    snapshot.oxygen?.bloodOxygenPercent ?? '-',
+    snapshot.metabolic?.bloodGlucoseMgDl ?? '-',
+  ].join('|');
+}
+
+function buildSnapshotStateKey(snapshot: HealthSnapshot): string {
+  const compact = compactSnapshotForAutoUpload(snapshot);
+  const payload = JSON.stringify({
+    source: compact.source,
+    authorized: compact.authorized,
+    activity: compact.activity,
+    sleep: compact.sleep,
+    heart: compact.heart,
+    oxygen: compact.oxygen,
+    metabolic: compact.metabolic,
+    environment: compact.environment,
+    body: compact.body,
+    workouts: compact.workouts,
+  });
+  return String(hashCode(payload));
+}
+
+function buildSleepStateKey(snapshot: HealthSnapshot): string {
+  const sleep = snapshot.sleep;
+  if (!sleep) {
+    return 'sleep:none';
+  }
+  const payload = JSON.stringify({
+    sleepScore: sleep.sleepScore,
+    asleepMinutesLast36h: sleep.asleepMinutesLast36h,
+    inBedMinutesLast36h: sleep.inBedMinutesLast36h,
+    awakeMinutesLast36h: sleep.awakeMinutesLast36h,
+    sampleCountLast36h: sleep.sampleCountLast36h,
+    stageMinutesLast36h: sleep.stageMinutesLast36h,
+    apnea: sleep.apnea,
+    latestSamples: sleep.samplesLast36h?.slice(-6).map(item => ({
+      stage: item.stage,
+      startDate: item.startDate,
+      endDate: item.endDate,
+    })),
+  });
+  return `sleep:${hashCode(payload)}`;
+}
+
+function buildSleepAdvicePrompt(snapshot: HealthSnapshot): string {
+  const sleep = snapshot.sleep;
+  const heart = snapshot.heart;
+  const oxygen = snapshot.oxygen;
+
+  return [
+    '请基于以下健康快照给出中医导向的睡眠建议。',
+    '要求：只输出 4 条内容（1. 睡眠状态判断 2. 今晚建议 3. 未来7天调理 4. 何时就医），每条简洁可执行。',
+    `睡眠评分: ${sleep?.sleepScore ?? '未知'}`,
+    `入睡时长(36h): ${sleep?.asleepMinutesLast36h ?? '未知'} 分钟`,
+    `在床时长(36h): ${sleep?.inBedMinutesLast36h ?? '未知'} 分钟`,
+    `睡眠呼吸暂停事件(30d): ${sleep?.apnea?.eventCountLast30d ?? '未知'}`,
+    `睡眠呼吸暂停风险: ${sleep?.apnea?.riskLevel ?? '未知'}`,
+    `最新心率: ${heart?.latestHeartRateBpm ?? '未知'} bpm`,
+    `HRV: ${heart?.heartRateVariabilityMs ?? '未知'} ms`,
+    `血氧: ${oxygen?.bloodOxygenPercent ?? '未知'} %`,
+  ].join('\n');
 }
 
 function hashCode(input: string): number {
@@ -438,6 +595,9 @@ function LoginScreen(): React.JSX.Element {
   const [lastHealthSyncAt, setLastHealthSyncAt] = useState<string | null>(null);
   const [lastHealthUploadAt, setLastHealthUploadAt] = useState<string | null>(null);
   const [lastHealthSource, setLastHealthSource] = useState<'healthkit' | 'mock' | null>(null);
+  const [sleepAdvice, setSleepAdvice] = useState('');
+  const [sleepAdviceLoading, setSleepAdviceLoading] = useState(false);
+  const [sleepAdviceUpdatedAt, setSleepAdviceUpdatedAt] = useState<string | null>(null);
   const [visualReady, setVisualReady] = useState(false);
   const [activePanel, setActivePanel] = useState<AppPanel>('home');
   const [chatInput, setChatInput] = useState('');
@@ -457,9 +617,22 @@ function LoginScreen(): React.JSX.Element {
   const chatScrollRef = useRef<ScrollView | null>(null);
   const appStateRef = useRef(AppState.currentState);
   const healthSyncInFlightRef = useRef(false);
-  const healthSyncTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const healthSyncTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const lastUploadDedupKeyRef = useRef<string | null>(null);
+  const lastUploadAttemptAtRef = useRef(0);
+  const lastSnapshotStateKeyRef = useRef<string | null>(null);
+  const latestSnapshotRef = useRef<HealthSnapshot | null>(null);
+  const lastSleepStateKeyRef = useRef<string | null>(null);
+  const sleepAdviceInFlightRef = useRef(false);
 
   const canUseHealth = Boolean(token);
+
+  const clearHealthSyncTimer = useCallback(() => {
+    if (healthSyncTimerRef.current) {
+      clearTimeout(healthSyncTimerRef.current);
+      healthSyncTimerRef.current = null;
+    }
+  }, []);
 
   const avatar = useMemo(() => buildAvatar(currentUser, avatarSeed), [currentUser, avatarSeed]);
   const normalizedUsername = username.trim().toLowerCase();
@@ -860,10 +1033,26 @@ function LoginScreen(): React.JSX.Element {
   };
 
   const uploadHealthSnapshotToBackend = useCallback(
-    async (snapshot: HealthSnapshot): Promise<{ uploadedAt: string; alerts: HealthRiskAlert[] }> => {
+    async (
+      snapshot: HealthSnapshot,
+      reason: 'manual' | 'auto' | 'chat'
+    ): Promise<{ uploadedAt: string; alerts: HealthRiskAlert[] }> => {
       if (!token) {
         throw new Error('未登录，无法上传健康快照');
       }
+
+      const snapshotForUpload = reason === 'auto' ? compactSnapshotForAutoUpload(snapshot) : snapshot;
+      const dedupKey = buildUploadDedupKey(snapshotForUpload);
+      const nowMs = Date.now();
+      if (
+        reason === 'auto' &&
+        lastUploadDedupKeyRef.current === dedupKey &&
+        nowMs - lastUploadAttemptAtRef.current < AUTO_UPLOAD_RETRY_DEDUP_MS
+      ) {
+        return { uploadedAt: new Date(lastUploadAttemptAtRef.current).toISOString(), alerts: [] };
+      }
+      lastUploadDedupKeyRef.current = dedupKey;
+      lastUploadAttemptAtRef.current = nowMs;
 
       const normalizedBase = normalizeApiBase();
       const response = await fetch(`${normalizedBase}/api/health/snapshots`, {
@@ -872,7 +1061,10 @@ function LoginScreen(): React.JSX.Element {
           'Content-Type': 'application/json',
           Authorization: `Bearer ${token}`,
         },
-        body: JSON.stringify({ snapshot }),
+        body: JSON.stringify({
+          snapshot: snapshotForUpload,
+          syncReason: reason,
+        }),
       });
 
       const { data } = await readApiResponse<{
@@ -888,6 +1080,59 @@ function LoginScreen(): React.JSX.Element {
         throw new Error(localizeErrorMessage(data?.message ?? '', fallbackMessage));
       }
       return { uploadedAt: data.uploadedAt, alerts: data.alerts ?? [] };
+    },
+    [token]
+  );
+
+  const fetchSleepAdvice = useCallback(
+    async (snapshot: HealthSnapshot): Promise<void> => {
+      if (!token || !snapshot.sleep || sleepAdviceInFlightRef.current) {
+        return;
+      }
+
+      const sleepKey = buildSleepStateKey(snapshot);
+      if (sleepKey === lastSleepStateKeyRef.current) {
+        return;
+      }
+
+      sleepAdviceInFlightRef.current = true;
+      setSleepAdviceLoading(true);
+
+      try {
+        const normalizedBase = normalizeApiBase();
+        const response = await fetch(`${normalizedBase}/api/agent/chat/health`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${token}`,
+          },
+          body: JSON.stringify({
+            message: buildSleepAdvicePrompt(snapshot),
+            topK: 4,
+            history: [],
+            latestHealthSnapshot: snapshot,
+          }),
+        });
+
+        const { data } = await readApiResponse<{ message?: string; answer?: string }>(response);
+        if (!response.ok || typeof data?.answer !== 'string') {
+          const fallbackMessage =
+            response.status >= 500
+              ? `服务暂时不可用（HTTP ${response.status}）`
+              : `睡眠建议获取失败（HTTP ${response.status}）`;
+          throw new Error(localizeErrorMessage(data?.message ?? '', fallbackMessage));
+        }
+
+        setSleepAdvice(toPlainChatText(data.answer));
+        setSleepAdviceUpdatedAt(new Date().toISOString());
+        lastSleepStateKeyRef.current = sleepKey;
+      } catch (error) {
+        const rawMessage = error instanceof Error ? error.message : '';
+        setSleepAdvice(`睡眠建议暂不可用：${localizeErrorMessage(rawMessage, '请稍后重试')}`);
+      } finally {
+        sleepAdviceInFlightRef.current = false;
+        setSleepAdviceLoading(false);
+      }
     },
     [token]
   );
@@ -1008,19 +1253,28 @@ function LoginScreen(): React.JSX.Element {
           }
         }
 
-        setHealthSnapshot(snapshot);
-        setVisualReady(true);
-        setHealthAuthorized(Boolean(snapshot.authorized));
-        setLastHealthSource(snapshot.source);
+        const nextSnapshotStateKey = buildSnapshotStateKey(snapshot);
+        const snapshotChanged = nextSnapshotStateKey !== lastSnapshotStateKeyRef.current;
 
-        const nowIso = new Date().toISOString();
-        setLastHealthSyncAt(nowIso);
+        if (snapshotChanged) {
+          setHealthSnapshot(snapshot);
+          latestSnapshotRef.current = snapshot;
+          lastSnapshotStateKeyRef.current = nextSnapshotStateKey;
+          setVisualReady(true);
+          setHealthAuthorized(Boolean(snapshot.authorized));
+          setLastHealthSource(snapshot.source);
+          setLastHealthSyncAt(new Date().toISOString());
+        }
+
+        if (!snapshotChanged) {
+          return latestSnapshotRef.current ?? snapshot;
+        }
 
         if (MUTE_HEALTH_SNAPSHOT_POST) {
           setLastHealthUploadAt(null);
         } else {
           try {
-            const uploaded = await uploadHealthSnapshotToBackend(snapshot);
+            const uploaded = await uploadHealthSnapshotToBackend(snapshot, reason);
             setLastHealthUploadAt(uploaded.uploadedAt);
             await handleRiskAlerts(uploaded.alerts ?? []);
           } catch (uploadError) {
@@ -1028,6 +1282,8 @@ function LoginScreen(): React.JSX.Element {
             setHealthError(localizeErrorMessage(uploadMessage, '健康数据读取成功，但上传失败'));
           }
         }
+
+        void fetchSleepAdvice(snapshot);
 
         return snapshot;
       } catch (error) {
@@ -1044,7 +1300,7 @@ function LoginScreen(): React.JSX.Element {
         }
       }
     },
-    [token, uploadHealthSnapshotToBackend, handleRiskAlerts]
+    [token, uploadHealthSnapshotToBackend, handleRiskAlerts, fetchSleepAdvice]
   );
 
   const ensureFreshHealthSnapshotForChat = useCallback(async (): Promise<HealthSnapshot | null> => {
@@ -1087,29 +1343,40 @@ function LoginScreen(): React.JSX.Element {
 
   useEffect(() => {
     if (!token || !autoHealthSyncEnabled || MUTE_AUTO_HEALTH_SYNC) {
-      if (healthSyncTimerRef.current) {
-        clearInterval(healthSyncTimerRef.current);
-        healthSyncTimerRef.current = null;
-      }
+      clearHealthSyncTimer();
       setAutoHealthSyncing(false);
       return;
     }
 
-    const runAutoSync = async () => {
-      await syncHealthSnapshot({ forceMock: false, silent: true, reason: 'auto' });
+    let cancelled = false;
+
+    const scheduleNext = (baseDelayMs: number) => {
+      if (cancelled) {
+        return;
+      }
+      const jitterMs = Math.floor(Math.random() * AUTO_HEALTH_SYNC_JITTER_MS);
+      clearHealthSyncTimer();
+      healthSyncTimerRef.current = setTimeout(() => {
+        void runAutoSync();
+      }, Math.max(3000, baseDelayMs + jitterMs));
     };
 
-    runAutoSync();
-    healthSyncTimerRef.current = setInterval(runAutoSync, HEALTH_SYNC_INTERVAL_MS);
+    const runAutoSync = async () => {
+      if (cancelled) {
+        return;
+      }
+      await syncHealthSnapshot({ forceMock: false, silent: true, reason: 'auto' });
+      scheduleNext(HEALTH_SYNC_INTERVAL_MS);
+    };
+
+    scheduleNext(AUTO_HEALTH_SYNC_INITIAL_DELAY_MS);
 
     return () => {
-      if (healthSyncTimerRef.current) {
-        clearInterval(healthSyncTimerRef.current);
-        healthSyncTimerRef.current = null;
-      }
+      cancelled = true;
+      clearHealthSyncTimer();
       setAutoHealthSyncing(false);
     };
-  }, [token, autoHealthSyncEnabled, syncHealthSnapshot]);
+  }, [token, autoHealthSyncEnabled, syncHealthSnapshot, clearHealthSyncTimer]);
 
   useEffect(() => {
     if (!token || !autoHealthSyncEnabled || MUTE_AUTO_HEALTH_SYNC) {
@@ -1250,11 +1517,14 @@ function LoginScreen(): React.JSX.Element {
   };
 
   const onLogout = () => {
-    if (healthSyncTimerRef.current) {
-      clearInterval(healthSyncTimerRef.current);
-      healthSyncTimerRef.current = null;
-    }
+    clearHealthSyncTimer();
     healthSyncInFlightRef.current = false;
+    lastUploadDedupKeyRef.current = null;
+    lastUploadAttemptAtRef.current = 0;
+    lastSnapshotStateKeyRef.current = null;
+    latestSnapshotRef.current = null;
+    lastSleepStateKeyRef.current = null;
+    sleepAdviceInFlightRef.current = false;
     const rememberedLogin = readRememberedLogin();
     setToken('');
     setCurrentUser(null);
@@ -1276,6 +1546,9 @@ function LoginScreen(): React.JSX.Element {
     setLastHealthSyncAt(null);
     setLastHealthUploadAt(null);
     setLastHealthSource(null);
+    setSleepAdvice('');
+    setSleepAdviceLoading(false);
+    setSleepAdviceUpdatedAt(null);
     setVisualReady(false);
     setTestMode(false);
     setActivePanel('home');
@@ -1789,6 +2062,24 @@ function LoginScreen(): React.JSX.Element {
                 </View>
 
                 {healthError ? <Text style={styles.healthError}>{healthError}</Text> : null}
+                {(sleepAdviceLoading || sleepAdvice) && visualReady ? (
+                  <View style={styles.sleepAdviceCard}>
+                    <View style={styles.sleepAdviceHeader}>
+                      <Text style={styles.sleepAdviceTitle}>中医睡眠建议</Text>
+                      {sleepAdviceUpdatedAt ? (
+                        <Text style={styles.sleepAdviceTime}>{formatDateLabel(sleepAdviceUpdatedAt)}</Text>
+                      ) : null}
+                    </View>
+                    {sleepAdviceLoading ? (
+                      <View style={styles.sleepAdviceLoadingRow}>
+                        <ActivityIndicator size="small" color="#a53c32" />
+                        <Text style={styles.sleepAdviceLoadingText}>正在生成睡眠调理建议...</Text>
+                      </View>
+                    ) : (
+                      <Text style={styles.sleepAdviceText}>{sleepAdvice}</Text>
+                    )}
+                  </View>
+                ) : null}
 
                 {visualReady && healthSnapshot ? (
                   <ScrollView
@@ -1797,7 +2088,7 @@ function LoginScreen(): React.JSX.Element {
                     showsVerticalScrollIndicator
                   >
                     <HealthInsightsBoard snapshot={healthSnapshot} />
-                    <SnapshotRawPanel snapshot={healthSnapshot} />
+                    {SHOW_HEALTH_RAW_PANEL ? <SnapshotRawPanel snapshot={healthSnapshot} /> : null}
                   </ScrollView>
                 ) : (
                   <View style={styles.visualPlaceholder}>
@@ -2509,6 +2800,44 @@ const styles = StyleSheet.create({
   healthError: {
     marginTop: 8,
     color: '#a7342d',
+    fontSize: 12,
+  },
+  sleepAdviceCard: {
+    marginTop: 10,
+    borderWidth: 1,
+    borderColor: '#dbc3a3',
+    borderRadius: 12,
+    backgroundColor: '#fffaf2',
+    paddingHorizontal: 10,
+    paddingVertical: 10,
+  },
+  sleepAdviceHeader: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    marginBottom: 6,
+  },
+  sleepAdviceTitle: {
+    color: '#5a3d23',
+    fontSize: 13,
+    fontWeight: '700',
+  },
+  sleepAdviceTime: {
+    color: '#8b7257',
+    fontSize: 10,
+  },
+  sleepAdviceText: {
+    color: '#61482d',
+    fontSize: 12,
+    lineHeight: 18,
+  },
+  sleepAdviceLoadingRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+  },
+  sleepAdviceLoadingText: {
+    color: '#7b6247',
     fontSize: 12,
   },
   visualScroll: {

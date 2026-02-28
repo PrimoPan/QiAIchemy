@@ -41,6 +41,8 @@ type RingSpec = {
   segmentThickness: number;
 };
 
+type TrendMetricKey = 'heart' | 'hrv' | 'oxygen';
+
 const ASLEEP_STAGES: Set<HealthSleepStageOrUnknown> = new Set([
   'asleepUnspecified',
   'asleepCore',
@@ -211,6 +213,24 @@ function buildSleepBlocks(segments: SleepSegment[]): SleepBlock[] {
   });
 
   return blocks;
+}
+
+function selectRecent24hPoints(points: HealthTrendPoint[] | undefined, maxPoints = 24): HealthTrendPoint[] {
+  if (!points?.length) {
+    return [];
+  }
+
+  const sorted = [...points].sort(
+    (left, right) => new Date(left.timestamp).getTime() - new Date(right.timestamp).getTime()
+  );
+  const cutoffMs = Date.now() - 24 * 60 * 60 * 1000;
+  const recent = sorted.filter(point => {
+    const ts = new Date(point.timestamp).getTime();
+    return Number.isFinite(ts) && ts >= cutoffMs;
+  });
+
+  const fallback = recent.length > 0 ? recent : sorted;
+  return fallback.slice(-maxPoints);
 }
 
 function chooseMainSleepBlock(blocks: SleepBlock[]): SleepBlock | null {
@@ -481,6 +501,7 @@ function MiniBarsInteractive({
 }
 
 export function HealthInsightsBoard({ snapshot }: HealthInsightsBoardProps): React.JSX.Element {
+  const [selectedTrendMetric, setSelectedTrendMetric] = useState<TrendMetricKey>('heart');
   const sleepSegments = useMemo(
     () => normalizeSleepSegments(snapshot.sleep?.samplesLast36h),
     [snapshot.sleep?.samplesLast36h]
@@ -504,17 +525,49 @@ export function HealthInsightsBoard({ snapshot }: HealthInsightsBoardProps): Rea
   const apnea = snapshot.sleep?.apnea;
   const apneaRisk = sleepApneaRiskViewModel(apnea?.riskLevel);
 
-  const heartTrend = (snapshot.heart?.heartRateSeriesLast24h ?? [])
-    .filter(point => point.value > 0)
-    .slice(-12);
-
-  const oxygenTrend = (snapshot.oxygen?.bloodOxygenSeriesLast24h ?? [])
-    .filter(point => point.value > 0)
-    .slice(-12);
+  const heartTrend = useMemo(
+    () => selectRecent24hPoints(snapshot.heart?.heartRateSeriesLast24h, 24),
+    [snapshot.heart?.heartRateSeriesLast24h]
+  );
+  const hrvTrend = useMemo(
+    () => selectRecent24hPoints(snapshot.heart?.heartRateVariabilitySeriesLast7d, 24),
+    [snapshot.heart?.heartRateVariabilitySeriesLast7d]
+  );
+  const oxygenTrend = useMemo(
+    () => selectRecent24hPoints(snapshot.oxygen?.bloodOxygenSeriesLast24h, 24),
+    [snapshot.oxygen?.bloodOxygenSeriesLast24h]
+  );
 
   const glucoseMmolL = mgDlToMmolL(snapshot.metabolic?.bloodGlucoseMgDl);
 
   const latestWorkout = snapshot.workouts?.[0];
+  const trendConfig = useMemo(() => {
+    if (selectedTrendMetric === 'hrv') {
+      return {
+        title: '近 24 小时 HRV（可点选）',
+        points: hrvTrend,
+        color: '#5f4a2f',
+        unitLabel: 'ms',
+        valueDigits: 1,
+      };
+    }
+    if (selectedTrendMetric === 'oxygen') {
+      return {
+        title: '近 24 小时血氧（可点选）',
+        points: oxygenTrend,
+        color: '#c48f55',
+        unitLabel: '%',
+        valueDigits: 0,
+      };
+    }
+    return {
+      title: '近 24 小时心率（可点选）',
+      points: heartTrend,
+      color: '#7a5b3e',
+      unitLabel: 'bpm',
+      valueDigits: 0,
+    };
+  }, [selectedTrendMetric, heartTrend, hrvTrend, oxygenTrend]);
 
   return (
     <View style={styles.board}>
@@ -526,7 +579,7 @@ export function HealthInsightsBoard({ snapshot }: HealthInsightsBoardProps): Rea
       <View style={styles.section}>
         <Text style={styles.sectionTitle}>睡眠分期与主睡眠时长</Text>
         <Text style={styles.sleepDocNote}>
-          HealthKit 的 `sleepAnalysis` 样本属于分类记录，阶段（卧床/各睡眠期/清醒）可能重叠；官方也没有固定“36小时”窗口，窗口由查询的起止时间决定。当前按样本自动识别主睡眠段，并以小时展示总睡眠时长。
+          睡眠分期来自 HealthKit `sleepAnalysis`，当前自动识别主睡眠段并按小时显示总睡眠时长。
         </Text>
 
         {sleepSegments.length > 0 ? (
@@ -606,9 +659,6 @@ export function HealthInsightsBoard({ snapshot }: HealthInsightsBoardProps): Rea
 
       <View style={styles.section}>
         <Text style={styles.sectionTitle}>太极运动三环（中国风）</Text>
-        <Text style={styles.sleepDocNote}>
-          保留 iOS 活动圆环逻辑：移动能量、锻炼分钟、站立小时；视觉用太极意象重绘，便于本土化表达。
-        </Text>
         <TaijiRings
           moveKcal={snapshot.activity?.activeEnergyKcalToday ?? 0}
           moveGoalKcal={snapshot.activity?.activeEnergyGoalKcal ?? 480}
@@ -622,18 +672,46 @@ export function HealthInsightsBoard({ snapshot }: HealthInsightsBoardProps): Rea
       <View style={styles.section}>
         <Text style={styles.sectionTitle}>心肺与代谢</Text>
         <View style={styles.metricGrid}>
-          <View style={styles.metricTile}>
+          <Pressable
+            style={[
+              styles.metricTile,
+              styles.metricTilePressable,
+              selectedTrendMetric === 'heart' && styles.metricTileActive,
+            ]}
+            onPress={() => setSelectedTrendMetric('heart')}
+          >
             <Text style={styles.metricTileLabel}>当前心率</Text>
             <Text style={styles.metricTileValue}>{fmt(snapshot.heart?.latestHeartRateBpm)} bpm</Text>
-          </View>
+            <Text style={styles.metricTileHint}>点按查看24h</Text>
+          </Pressable>
           <View style={styles.metricTile}>
             <Text style={styles.metricTileLabel}>静息心率</Text>
             <Text style={styles.metricTileValue}>{fmt(snapshot.heart?.restingHeartRateBpm)} bpm</Text>
           </View>
-          <View style={styles.metricTile}>
+          <Pressable
+            style={[
+              styles.metricTile,
+              styles.metricTilePressable,
+              selectedTrendMetric === 'oxygen' && styles.metricTileActive,
+            ]}
+            onPress={() => setSelectedTrendMetric('oxygen')}
+          >
             <Text style={styles.metricTileLabel}>血氧</Text>
             <Text style={styles.metricTileValue}>{fmt(snapshot.oxygen?.bloodOxygenPercent, 0)} %</Text>
-          </View>
+            <Text style={styles.metricTileHint}>点按查看24h</Text>
+          </Pressable>
+          <Pressable
+            style={[
+              styles.metricTile,
+              styles.metricTilePressable,
+              selectedTrendMetric === 'hrv' && styles.metricTileActive,
+            ]}
+            onPress={() => setSelectedTrendMetric('hrv')}
+          >
+            <Text style={styles.metricTileLabel}>HRV</Text>
+            <Text style={styles.metricTileValue}>{fmt(snapshot.heart?.heartRateVariabilityMs, 1)} ms</Text>
+            <Text style={styles.metricTileHint}>点按查看24h</Text>
+          </Pressable>
           <View style={styles.metricTile}>
             <Text style={styles.metricTileLabel}>血糖（mmol/L）</Text>
             <Text style={styles.metricTileValue}>{fmt(glucoseMmolL, 1)}</Text>
@@ -642,19 +720,11 @@ export function HealthInsightsBoard({ snapshot }: HealthInsightsBoardProps): Rea
         </View>
 
         <MiniBarsInteractive
-          title="近 12 小时心率波动（可点选）"
-          points={heartTrend}
-          color="#7a5b3e"
-          unitLabel="bpm"
-          valueDigits={0}
-        />
-
-        <MiniBarsInteractive
-          title="近 12 小时血氧波动（可点选）"
-          points={oxygenTrend}
-          color="#c48f55"
-          unitLabel="%"
-          valueDigits={0}
+          title={trendConfig.title}
+          points={trendConfig.points}
+          color={trendConfig.color}
+          unitLabel={trendConfig.unitLabel}
+          valueDigits={trendConfig.valueDigits}
         />
       </View>
 
@@ -666,8 +736,8 @@ export function HealthInsightsBoard({ snapshot }: HealthInsightsBoardProps): Rea
             <Text style={styles.metricValue}>{fmt(snapshot.body?.respiratoryRateBrpm, 1)} brpm</Text>
           </View>
           <View style={styles.metricPill}>
-            <Text style={styles.metricLabel}>HRV</Text>
-            <Text style={styles.metricValue}>{fmt(snapshot.heart?.heartRateVariabilityMs, 1)} ms</Text>
+            <Text style={styles.metricLabel}>日照时长</Text>
+            <Text style={styles.metricValue}>{fmt(snapshot.environment?.daylightMinutesToday, 0)} 分钟</Text>
           </View>
           <View style={styles.metricPill}>
             <Text style={styles.metricLabel}>体重</Text>
@@ -851,6 +921,13 @@ const styles = StyleSheet.create({
     paddingHorizontal: 8,
     paddingVertical: 8,
   },
+  metricTilePressable: {
+    position: 'relative',
+  },
+  metricTileActive: {
+    borderColor: '#9f6f45',
+    backgroundColor: '#f8ecda',
+  },
   metricTileLabel: {
     color: '#795f44',
     fontSize: 11,
@@ -864,6 +941,11 @@ const styles = StyleSheet.create({
   metricTileSub: {
     marginTop: 3,
     color: '#856748',
+    fontSize: 10,
+  },
+  metricTileHint: {
+    marginTop: 3,
+    color: '#8b7358',
     fontSize: 10,
   },
   chartSection: {
