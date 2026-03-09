@@ -2,6 +2,8 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
   ActivityIndicator,
   Alert,
+  AppState,
+  Keyboard,
   KeyboardAvoidingView,
   Modal,
   Platform,
@@ -15,6 +17,8 @@ import {
   TextInput,
   Vibration,
   View,
+  type AppStateStatus,
+  type KeyboardEvent,
 } from 'react-native';
 import {
   loadAlertingMockHealthSnapshot,
@@ -99,6 +103,9 @@ type SealLogoProps = {
 const API_BASE_URL = 'http://43.138.212.17:2818';
 const AUTO_UPLOAD_SERIES_LIMIT = 48;
 const AUTO_UPLOAD_SLEEP_SAMPLES_LIMIT = 80;
+const AUTO_HEALTH_SYNC_INTERVAL_MS = 60 * 60 * 1000;
+const AUTO_HEALTH_SYNC_COOLDOWN_MS = 90 * 1000;
+const HEALTH_ALERT_POPUP_COOLDOWN_MS = 2 * 60 * 1000;
 const SHOW_HEALTH_RAW_PANEL = false;
 // Debug switch: print full health snapshot JSON after each successful read.
 const LOG_HEALTH_SNAPSHOT_JSON = true;
@@ -472,6 +479,34 @@ function formatSignalValue(signal: HealthRiskSignal): string {
   return signal.unit ? ` (${signal.latestValue}${signal.unit})` : ` (${signal.latestValue})`;
 }
 
+function formatAlertValueForFingerprint(value: number | undefined): string {
+  if (typeof value !== 'number' || Number.isNaN(value)) {
+    return 'na';
+  }
+  return value.toFixed(1);
+}
+
+function buildHealthAlertFingerprint(signals: HealthRiskSignal[]): string {
+  return [...signals]
+    .sort((left, right) => left.code.localeCompare(right.code))
+    .map(
+      signal =>
+        `${signal.code}:${signal.severity}:${formatAlertValueForFingerprint(signal.latestValue)}:${signal.latestMessage}`
+    )
+    .join('|');
+}
+
+function buildHealthAlertDialogMessage(signals: HealthRiskSignal[]): string {
+  const topSignals = signals.slice(0, 3).map(
+    (signal, index) => `${index + 1}. ${signal.title}：${signal.latestMessage}`
+  );
+
+  const footer =
+    signals.length > 3 ? `另有 ${signals.length - 3} 项提醒，建议进入详细分析查看。` : '建议尽快查看详细分析并及时调整当天作息。';
+
+  return ['刚读取到新的健康提醒：', ...topSignals, footer].join('\n');
+}
+
 function buildProactiveHealthPrompt(signals: HealthRiskSignal[]): string {
   const signalLines = signals.map(
     (signal, index) =>
@@ -598,7 +633,7 @@ function SnapshotRawPanel({ snapshot }: { snapshot: HealthSnapshot }): React.JSX
       ? '演示样本'
       : snapshot.source === 'huawei_health'
       ? '华为健康'
-      : 'Apple 健康真机';
+      : '苹果健康真机';
 
   const rows = [
     {
@@ -816,6 +851,7 @@ function LoginScreen(): React.JSX.Element {
   const [chatInput, setChatInput] = useState('');
   const [chatMessages, setChatMessages] = useState<ChatMessage[]>([]);
   const [chatLoading, setChatLoading] = useState(false);
+  const [chatKeyboardInset, setChatKeyboardInset] = useState(0);
   const [chatSessionId, setChatSessionId] = useState(0);
   const [chatSessions, setChatSessions] = useState<ChatSessionRecord[]>([]);
   const [chatDrawerVisible, setChatDrawerVisible] = useState(false);
@@ -833,17 +869,21 @@ function LoginScreen(): React.JSX.Element {
   const sleepAdviceInFlightRef = useRef(false);
   const lastChatHealthSessionIdRef = useRef<number | null>(null);
   const lastBootstrapTokenRef = useRef<string | null>(null);
+  const appStateRef = useRef(AppState.currentState);
+  const lastAutoHealthSyncAtRef = useRef(0);
+  const lastHealthAlertFingerprintRef = useRef<string | null>(null);
+  const lastHealthAlertAtRef = useRef(0);
 
   const canUseHealth = Boolean(token);
   const isAndroid = Platform.OS === 'android';
-  const healthPanelTitle = isAndroid ? '华为健康同步与建议' : 'Apple 健康同步与建议';
+  const healthPanelTitle = isAndroid ? '华为健康同步与建议' : '苹果健康同步与建议';
   const healthHintText = isAndroid
     ? '可手动同步华为健康数据，也可用演示样本预览界面；登录后会自动同步一次健康数据，正式聊天会在每个新会话首条消息前再读取一次。'
-    : '可手动同步 Apple 健康数据；登录后会自动同步一次健康数据，正式聊天会在每个新会话首条消息前再读取一次。';
-  const healthRealButtonText = isAndroid ? '同步华为健康数据' : '同步 Apple 健康数据';
+    : '可手动同步苹果健康数据；登录后会自动同步一次健康数据，正式聊天会在每个新会话首条消息前再读取一次。';
+  const healthRealButtonText = isAndroid ? '同步华为健康数据' : '同步苹果健康数据';
   const visualPlaceholderText = isAndroid
     ? '点击“同步华为健康数据”或“使用演示样本”后，这里会展示你的健康总览与养生建议。'
-    : '点击“同步 Apple 健康数据”后，这里会展示你的健康总览与养生建议。';
+    : '点击“同步苹果健康数据”后，这里会展示你的健康总览与养生建议。';
 
   const avatar = useMemo(() => buildAvatar(currentUser, avatarSeed), [currentUser, avatarSeed]);
   const normalizedUsername = username.trim().toLowerCase();
@@ -869,11 +909,36 @@ function LoginScreen(): React.JSX.Element {
 
   const createMessageId = () => `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 
-  const scrollChatToBottom = (animated = true) => {
+  const scrollChatToBottom = useCallback((animated = true) => {
     requestAnimationFrame(() => {
       chatScrollRef.current?.scrollToEnd({ animated });
     });
-  };
+  }, []);
+
+  useEffect(() => {
+    if (Platform.OS !== 'ios') {
+      return;
+    }
+
+    const handleKeyboardFrameChange = (event: KeyboardEvent) => {
+      const nextInset = Math.max(event.endCoordinates.height - 6, 0);
+      setChatKeyboardInset(nextInset);
+      scrollChatToBottom(false);
+    };
+
+    const handleKeyboardHide = () => {
+      setChatKeyboardInset(0);
+      scrollChatToBottom(false);
+    };
+
+    const frameSubscription = Keyboard.addListener('keyboardWillChangeFrame', handleKeyboardFrameChange);
+    const hideSubscription = Keyboard.addListener('keyboardWillHide', handleKeyboardHide);
+
+    return () => {
+      frameSubscription.remove();
+      hideSubscription.remove();
+    };
+  }, [scrollChatToBottom]);
 
   const getSessionTitle = useCallback((messages: ChatMessage[]): string => {
     const firstUser = messages.find(item => item.role === 'user');
@@ -1218,7 +1283,10 @@ function LoginScreen(): React.JSX.Element {
     async (
       snapshot: HealthSnapshot,
       signals: HealthRiskSignal[],
-      existingSessions: ChatSessionRecord[]
+      existingSessions: ChatSessionRecord[],
+      options: {
+        vibrate?: boolean;
+      } = {}
     ): Promise<void> => {
       if (!token || signals.length === 0) {
         return;
@@ -1241,7 +1309,9 @@ function LoginScreen(): React.JSX.Element {
       });
       const nextSessionId =
         reusableSession?.id ?? Math.max(chatSessionId, ...existingSessions.map(item => item.id), 0) + 1;
-      Vibration.vibrate();
+      if (options.vibrate !== false) {
+        Vibration.vibrate();
+      }
       setActivePanel('chat');
       setTestMode(false);
       setChatDrawerVisible(false);
@@ -1313,6 +1383,42 @@ function LoginScreen(): React.JSX.Element {
       }
     },
     [token, chatSessionId, persistChatSessionToServer, upsertChatSession]
+  );
+
+  const presentHealthRiskAlert = useCallback(
+    (
+      snapshot: HealthSnapshot,
+      signals: HealthRiskSignal[],
+      existingSessions: ChatSessionRecord[]
+    ): void => {
+      if (!token || signals.length === 0) {
+        return;
+      }
+
+      const fingerprint = buildHealthAlertFingerprint(signals);
+      const now = Date.now();
+      if (
+        lastHealthAlertFingerprintRef.current === fingerprint &&
+        now - lastHealthAlertAtRef.current < HEALTH_ALERT_POPUP_COOLDOWN_MS
+      ) {
+        return;
+      }
+
+      lastHealthAlertFingerprintRef.current = fingerprint;
+      lastHealthAlertAtRef.current = now;
+      Vibration.vibrate([0, 180, 120, 180]);
+
+      Alert.alert('发现健康提醒', buildHealthAlertDialogMessage(signals), [
+        { text: '稍后查看', style: 'cancel' },
+        {
+          text: '查看分析',
+          onPress: () => {
+            startProactiveLoginReview(snapshot, signals, existingSessions, { vibrate: false }).catch(() => {});
+          },
+        },
+      ]);
+    },
+    [token, startProactiveLoginReview]
   );
 
   useEffect(() => {
@@ -1740,7 +1846,7 @@ function LoginScreen(): React.JSX.Element {
       const result = await syncHealthSnapshot({
         silent: true,
         syncReason: 'chat',
-        fallbackToAlertingMock: true,
+        fallbackToAlertingMock: false,
       });
       if (result.snapshot) {
         lastChatHealthSessionIdRef.current = sessionId;
@@ -1775,7 +1881,7 @@ function LoginScreen(): React.JSX.Element {
         const healthSyncResult = await syncHealthSnapshot({
           silent: true,
           syncReason: 'auto',
-          fallbackToAlertingMock: true,
+          fallbackToAlertingMock: false,
         });
         if (cancelled) {
           return;
@@ -1786,9 +1892,10 @@ function LoginScreen(): React.JSX.Element {
           return;
         }
         setHealthProfile(profile);
+        lastAutoHealthSyncAtRef.current = Date.now();
 
-        if (healthSyncResult.snapshot && healthSyncResult.alerts.length > 0) {
-          await startProactiveLoginReview(healthSyncResult.snapshot, healthSyncResult.alerts, sessions);
+        if (Platform.OS === 'ios' && healthSyncResult.snapshot && healthSyncResult.alerts.length > 0) {
+          presentHealthRiskAlert(healthSyncResult.snapshot, healthSyncResult.alerts, sessions);
         }
       } catch (error) {
         if (!cancelled) {
@@ -1807,7 +1914,67 @@ function LoginScreen(): React.JSX.Element {
     return () => {
       cancelled = true;
     };
-  }, [token, fetchStoredChatSessions, syncHealthSnapshot, fetchHealthProfile, startProactiveLoginReview]);
+  }, [token, fetchStoredChatSessions, syncHealthSnapshot, fetchHealthProfile, presentHealthRiskAlert]);
+
+  const runAutoHealthSync = useCallback(
+    async (
+      options: {
+        existingSessions?: ChatSessionRecord[];
+        bypassCooldown?: boolean;
+      } = {}
+    ): Promise<void> => {
+      if (!token || Platform.OS !== 'ios') {
+        return;
+      }
+
+      const now = Date.now();
+      if (
+        !options.bypassCooldown &&
+        now - lastAutoHealthSyncAtRef.current < AUTO_HEALTH_SYNC_COOLDOWN_MS
+      ) {
+        return;
+      }
+
+      lastAutoHealthSyncAtRef.current = now;
+      const result = await syncHealthSnapshot({
+        silent: true,
+        syncReason: 'auto',
+        fallbackToAlertingMock: false,
+      });
+
+      if (result.snapshot && result.alerts.length > 0) {
+        presentHealthRiskAlert(result.snapshot, result.alerts, options.existingSessions ?? chatSessions);
+      }
+    },
+    [chatSessions, presentHealthRiskAlert, syncHealthSnapshot, token]
+  );
+
+  useEffect(() => {
+    if (!token || Platform.OS !== 'ios') {
+      return;
+    }
+
+    appStateRef.current = AppState.currentState;
+    const handleAppStateChange = (nextState: AppStateStatus) => {
+      const wasInactive = appStateRef.current === 'inactive' || appStateRef.current === 'background';
+      appStateRef.current = nextState;
+      if (wasInactive && nextState === 'active') {
+        runAutoHealthSync().catch(() => {});
+      }
+    };
+
+    const appStateSubscription = AppState.addEventListener('change', handleAppStateChange);
+    const intervalId = setInterval(() => {
+      if (appStateRef.current === 'active') {
+        runAutoHealthSync().catch(() => {});
+      }
+    }, AUTO_HEALTH_SYNC_INTERVAL_MS);
+
+    return () => {
+      appStateSubscription.remove();
+      clearInterval(intervalId);
+    };
+  }, [token, runAutoHealthSync]);
 
   useEffect(() => {
     if (!token) {
@@ -1976,6 +2143,10 @@ function LoginScreen(): React.JSX.Element {
     lastSleepStateKeyRef.current = null;
     sleepAdviceInFlightRef.current = false;
     lastChatHealthSessionIdRef.current = null;
+    lastAutoHealthSyncAtRef.current = 0;
+    lastHealthAlertFingerprintRef.current = null;
+    lastHealthAlertAtRef.current = 0;
+    setChatKeyboardInset(0);
     const rememberedLogin = readRememberedLogin();
     setToken('');
     setCurrentUser(null);
@@ -2103,12 +2274,25 @@ function LoginScreen(): React.JSX.Element {
       ) : null}
 
       <KeyboardAvoidingView
-        behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
-        keyboardVerticalOffset={Platform.OS === 'ios' ? 16 : 0}
+        behavior={
+          Platform.OS === 'ios' && activePanel === 'chat'
+            ? undefined
+            : Platform.OS === 'ios'
+              ? 'padding'
+              : 'height'
+        }
+        keyboardVerticalOffset={0}
         style={styles.flex}
       >
         {token && activePanel === 'chat' ? (
-          <View style={styles.chatFullscreen}>
+          <View
+            style={[
+              styles.chatFullscreen,
+              Platform.OS === 'ios' && chatKeyboardInset > 0
+                ? { paddingBottom: 10 + chatKeyboardInset }
+                : null,
+            ]}
+          >
             <View style={styles.chatSurface}>
               <View style={styles.chatPanel}>
                 <View style={styles.chatHeaderTopRow}>
@@ -2225,6 +2409,7 @@ function LoginScreen(): React.JSX.Element {
                   ref={chatScrollRef}
                   style={styles.chatScroll}
                   contentContainerStyle={styles.chatScrollContent}
+                  automaticallyAdjustKeyboardInsets={Platform.OS === 'ios'}
                   keyboardShouldPersistTaps="handled"
                   showsVerticalScrollIndicator
                   onContentSizeChange={() => scrollChatToBottom(true)}
@@ -2261,11 +2446,12 @@ function LoginScreen(): React.JSX.Element {
                   ))}
                 </ScrollView>
 
-                <View style={styles.chatComposer}>
+                <View style={[styles.chatComposer, chatKeyboardInset > 0 ? styles.chatComposerRaised : null]}>
                   <TextInput
                     style={styles.chatInput}
                     value={chatInput}
                     onChangeText={setChatInput}
+                    onFocus={() => scrollChatToBottom(false)}
                     placeholder="输入你的问题，如：最近焦虑失眠，给我7天计划"
                     placeholderTextColor="#9b8469"
                     multiline
@@ -3400,6 +3586,9 @@ const styles = StyleSheet.create({
     alignItems: 'flex-end',
     gap: 8,
   },
+  chatComposerRaised: {
+    marginTop: 8,
+  },
   chatInput: {
     flex: 1,
     minHeight: 44,
@@ -3470,6 +3659,9 @@ const styles = StyleSheet.create({
   },
   testEntryButton: {
     flex: 1,
+    minHeight: 114,
+    marginTop: 0,
+    justifyContent: 'center',
   },
   homeEntryCard: {
     gap: 14,
@@ -3479,8 +3671,11 @@ const styles = StyleSheet.create({
     gap: 10,
   },
   homePrimaryActionButton: {
-    flex: 1.15,
-    alignItems: 'flex-start',
+    flex: 1,
+    minHeight: 114,
+    alignItems: 'center',
+    justifyContent: 'center',
+    paddingHorizontal: 18,
     paddingTop: 14,
     paddingBottom: 14,
   },
@@ -3489,6 +3684,7 @@ const styles = StyleSheet.create({
     color: '#f8dfd7',
     fontSize: 11,
     lineHeight: 16,
+    textAlign: 'center',
   },
   homeSecondaryActionMeta: {
     marginTop: 6,
