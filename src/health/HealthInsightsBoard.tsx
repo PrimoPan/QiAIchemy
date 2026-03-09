@@ -327,7 +327,7 @@ function TaijiRings({
       label: '行气环',
       value: moveKcal,
       target: moveGoalKcal,
-      unit: 'kcal',
+      unit: '千卡',
       color: '#b53f33',
       trackColor: '#ead2c5',
       radius: 92,
@@ -338,7 +338,7 @@ function TaijiRings({
       label: '强身环',
       value: exerciseMin / 60,
       target: exerciseGoalMin / 60,
-      unit: 'h',
+      unit: '小时',
       color: '#bc7d42',
       trackColor: '#efe0cd',
       radius: 72,
@@ -349,7 +349,7 @@ function TaijiRings({
       label: '立身环',
       value: standHours,
       target: standGoalHours,
-      unit: 'h',
+      unit: '小时',
       color: '#6f5339',
       trackColor: '#e8dccf',
       radius: 52,
@@ -551,10 +551,10 @@ export function HealthInsightsBoard({ snapshot }: HealthInsightsBoardProps): Rea
   const trendConfig = useMemo(() => {
     if (selectedTrendMetric === 'hrv') {
       return {
-        title: '近 24 小时 HRV（可点选）',
+        title: '近 24 小时心率变异性（可点选）',
         points: hrvTrend,
         color: '#5f4a2f',
-        unitLabel: 'ms',
+        unitLabel: '毫秒',
         valueDigits: 1,
       };
     }
@@ -571,7 +571,7 @@ export function HealthInsightsBoard({ snapshot }: HealthInsightsBoardProps): Rea
       title: '近 24 小时心率（可点选）',
       points: heartTrend,
       color: '#7a5b3e',
-      unitLabel: 'bpm',
+      unitLabel: '次/分',
       valueDigits: 0,
     };
   }, [selectedTrendMetric, heartTrend, hrvTrend, oxygenTrend]);
@@ -586,7 +586,7 @@ export function HealthInsightsBoard({ snapshot }: HealthInsightsBoardProps): Rea
       <View style={styles.section}>
         <Text style={styles.sectionTitle}>睡眠分期与主睡眠时长</Text>
         <Text style={styles.sleepDocNote}>
-          睡眠分期来自 HealthKit `sleepAnalysis`，当前自动识别主睡眠段并按小时显示总睡眠时长。
+          睡眠分期来自 Apple 健康的睡眠分析数据，当前会自动识别主睡眠段并按小时显示总睡眠时长。
         </Text>
 
         {sleepSegments.length > 0 ? (
@@ -624,7 +624,7 @@ export function HealthInsightsBoard({ snapshot }: HealthInsightsBoardProps): Rea
             </View>
           </>
         ) : (
-          <Text style={styles.emptyHint}>暂无睡眠样本（可先点击“读取健康数据”）</Text>
+          <Text style={styles.emptyHint}>暂无睡眠样本（可先点击“同步健康数据”）</Text>
         )}
 
         <View style={styles.metricRow}>
@@ -688,12 +688,12 @@ export function HealthInsightsBoard({ snapshot }: HealthInsightsBoardProps): Rea
             onPress={() => setSelectedTrendMetric('heart')}
           >
             <Text style={styles.metricTileLabel}>当前心率</Text>
-            <Text style={styles.metricTileValue}>{fmt(snapshot.heart?.latestHeartRateBpm)} bpm</Text>
+            <Text style={styles.metricTileValue}>{fmt(snapshot.heart?.latestHeartRateBpm)} 次/分</Text>
             <Text style={styles.metricTileHint}>点按查看24h</Text>
           </Pressable>
           <View style={styles.metricTile}>
             <Text style={styles.metricTileLabel}>静息心率</Text>
-            <Text style={styles.metricTileValue}>{fmt(snapshot.heart?.restingHeartRateBpm)} bpm</Text>
+            <Text style={styles.metricTileValue}>{fmt(snapshot.heart?.restingHeartRateBpm)} 次/分</Text>
           </View>
           <Pressable
             style={[
@@ -715,8 +715,8 @@ export function HealthInsightsBoard({ snapshot }: HealthInsightsBoardProps): Rea
             ]}
             onPress={() => setSelectedTrendMetric('hrv')}
           >
-            <Text style={styles.metricTileLabel}>HRV</Text>
-            <Text style={styles.metricTileValue}>{fmt(snapshot.heart?.heartRateVariabilityMs, 1)} ms</Text>
+            <Text style={styles.metricTileLabel}>心率变异性</Text>
+            <Text style={styles.metricTileValue}>{fmt(snapshot.heart?.heartRateVariabilityMs, 1)} 毫秒</Text>
             <Text style={styles.metricTileHint}>点按查看24h</Text>
           </Pressable>
           <View style={styles.metricTile}>
@@ -740,7 +740,7 @@ export function HealthInsightsBoard({ snapshot }: HealthInsightsBoardProps): Rea
         <View style={styles.metricRow}>
           <View style={styles.metricPill}>
             <Text style={styles.metricLabel}>呼吸频率</Text>
-            <Text style={styles.metricValue}>{fmt(snapshot.body?.respiratoryRateBrpm, 1)} brpm</Text>
+            <Text style={styles.metricValue}>{fmt(snapshot.body?.respiratoryRateBrpm, 1)} 次/分</Text>
           </View>
           <View style={styles.metricPill}>
             <Text style={styles.metricLabel}>日照时长</Text>
