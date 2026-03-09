@@ -1151,22 +1151,22 @@ export async function loadHealthSnapshot(useMock = false): Promise<HealthKitAllD
   }
 
   if (!HealthKitManager) {
-    throw new Error('HealthKit 原生模块不可用，请确认 iOS 工程已正确集成');
+    throw new Error('苹果健康原生模块不可用，请确认 iOS 工程已正确集成');
   }
 
   const isAvailable = await withTimeout(
     HealthKitManager.isHealthDataAvailable(),
     5000,
-    'HealthKit 可用性检查超时，请重试'
+    '苹果健康可用性检查超时，请重试'
   );
   if (!isAvailable) {
-    throw new Error('当前设备不支持 HealthKit 数据读取');
+    throw new Error('当前设备不支持苹果健康数据读取');
   }
 
   const authorized = await withTimeout(
     HealthKitManager.requestAuthorization(),
     15000,
-    'HealthKit 授权超时，请在系统设置中确认后重试'
+    '苹果健康授权超时，请在系统设置中确认后重试'
   );
   if (!authorized) {
     throw new Error('未授予健康数据读取权限');
@@ -1176,7 +1176,7 @@ export async function loadHealthSnapshot(useMock = false): Promise<HealthKitAllD
     const nativeSnapshot = await withTimeout(
       HealthKitManager.getHealthSnapshot(),
       25000,
-      'HealthKit 数据读取超时，请稍后重试'
+      '苹果健康数据读取超时，请稍后重试'
     );
     return {
       source: 'healthkit',

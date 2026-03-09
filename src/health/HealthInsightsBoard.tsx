@@ -586,7 +586,7 @@ export function HealthInsightsBoard({ snapshot }: HealthInsightsBoardProps): Rea
       <View style={styles.section}>
         <Text style={styles.sectionTitle}>睡眠分期与主睡眠时长</Text>
         <Text style={styles.sleepDocNote}>
-          睡眠分期来自 Apple 健康的睡眠分析数据，当前会自动识别主睡眠段并按小时显示总睡眠时长。
+          睡眠分期来自苹果健康的睡眠分析数据，当前会自动识别主睡眠段并按小时显示总睡眠时长。
         </Text>
 
         {sleepSegments.length > 0 ? (
