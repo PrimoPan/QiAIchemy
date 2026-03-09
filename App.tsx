@@ -23,6 +23,7 @@ import {
   type HealthWorkoutRecord,
 } from './src/health/healthData';
 import { HealthInsightsBoard } from './src/health/HealthInsightsBoard';
+import { WellnessArticleShelf, type WellnessArticle } from './src/content/WellnessArticleShelf';
 
 type AuthMode = 'login' | 'register';
 type EditorMode = 'name' | 'password';
@@ -436,8 +437,8 @@ function buildSleepAdvicePrompt(snapshot: HealthSnapshot): string {
     `在床时长(36h): ${formatHours(sleep?.inBedMinutesLast36h)}`,
     `睡眠呼吸暂停事件(30d): ${sleep?.apnea?.eventCountLast30d ?? '未知'}`,
     `睡眠呼吸暂停风险: ${sleep?.apnea?.riskLevel ?? '未知'}`,
-    `最新心率: ${heart?.latestHeartRateBpm ?? '未知'} bpm`,
-    `HRV: ${heart?.heartRateVariabilityMs ?? '未知'} ms`,
+    `最新心率: ${heart?.latestHeartRateBpm ?? '未知'} 次/分`,
+    `心率变异性: ${heart?.heartRateVariabilityMs ?? '未知'} 毫秒`,
     `血氧: ${oxygen?.bloodOxygenPercent ?? '未知'} %`,
   ].join('\n');
 }
@@ -594,26 +595,26 @@ function SnapshotRawPanel({ snapshot }: { snapshot: HealthSnapshot }): React.JSX
   const glucoseMmolL = mgDlToMmolL(snapshot.metabolic?.bloodGlucoseMgDl);
   const sourceLabel =
     snapshot.source === 'mock'
-      ? 'Mock'
+      ? '演示样本'
       : snapshot.source === 'huawei_health'
       ? '华为健康'
-      : 'HealthKit 真机';
+      : 'Apple 健康真机';
 
   const rows = [
     {
       label: '活动趋势点',
       value: `${snapshot.activity?.stepsHourlySeriesToday?.length ?? 0} / ${snapshot.activity?.activeEnergyHourlySeriesToday?.length ?? 0} / ${snapshot.activity?.exerciseMinutesHourlySeriesToday?.length ?? 0}`,
-      note: `步数/活动能量/运动时长 · 圆环目标 Move ${formatMetric(snapshot.activity?.activeEnergyGoalKcal)} kcal / Exercise ${formatHours(snapshot.activity?.exerciseGoalMinutes)} / Stand ${formatMetric(snapshot.activity?.standGoalHours)} 小时`,
+      note: `步数/活动能量/运动时长 · 圆环目标 行气 ${formatMetric(snapshot.activity?.activeEnergyGoalKcal)} 千卡 / 强身 ${formatHours(snapshot.activity?.exerciseGoalMinutes)} / 立身 ${formatMetric(snapshot.activity?.standGoalHours)} 小时`,
     },
     {
       label: '睡眠样本',
       value: `${snapshot.sleep?.samplesLast36h?.length ?? 0}`,
-      note: `分期统计: Core ${formatHours(snapshot.sleep?.stageMinutesLast36h?.asleepCoreMinutes)}, Deep ${formatHours(snapshot.sleep?.stageMinutesLast36h?.asleepDeepMinutes)}, REM ${formatHours(snapshot.sleep?.stageMinutesLast36h?.asleepREMMinutes)}, Apnea ${formatMetric(snapshot.sleep?.apnea?.eventCountLast30d)} 次`,
+      note: `分期统计: 浅睡 ${formatHours(snapshot.sleep?.stageMinutesLast36h?.asleepCoreMinutes)}, 深睡 ${formatHours(snapshot.sleep?.stageMinutesLast36h?.asleepDeepMinutes)}, 快速眼动 ${formatHours(snapshot.sleep?.stageMinutesLast36h?.asleepREMMinutes)}, 呼吸暂停 ${formatMetric(snapshot.sleep?.apnea?.eventCountLast30d)} 次`,
     },
     {
       label: '心率趋势点',
       value: `${snapshot.heart?.heartRateSeriesLast24h?.length ?? 0}`,
-      note: `HRV 趋势点: ${snapshot.heart?.heartRateVariabilitySeriesLast7d?.length ?? 0}`,
+      note: `心率变异性趋势点: ${snapshot.heart?.heartRateVariabilitySeriesLast7d?.length ?? 0}`,
     },
     {
       label: '血氧趋势点',
@@ -633,7 +634,7 @@ function SnapshotRawPanel({ snapshot }: { snapshot: HealthSnapshot }): React.JSX
     {
       label: '体征趋势点',
       value: `${snapshot.body?.respiratoryRateSeriesLast7d?.length ?? 0} / ${snapshot.heart?.heartRateVariabilitySeriesLast7d?.length ?? 0} / ${snapshot.body?.bodyMassSeriesLast30d?.length ?? 0}`,
-      note: '呼吸/HRV/体重',
+      note: '呼吸频率/心率变异性/体重',
     },
   ];
 
@@ -654,7 +655,7 @@ function SnapshotRawPanel({ snapshot }: { snapshot: HealthSnapshot }): React.JSX
       </View>
 
       <View style={styles.rawWorkoutCard}>
-        <Text style={styles.rawWorkoutTitle}>最近运动记录（Top 3）</Text>
+        <Text style={styles.rawWorkoutTitle}>最近运动记录（最近 3 条）</Text>
         {latestWorkouts.length === 0 ? (
           <Text style={styles.rawWorkoutText}>暂无记录</Text>
         ) : (
@@ -662,7 +663,7 @@ function SnapshotRawPanel({ snapshot }: { snapshot: HealthSnapshot }): React.JSX
             <Text key={`${workout.startDate ?? 'unknown'}-${index}`} style={styles.rawWorkoutText}>
               {index + 1}. {workout.activityTypeName ?? workout.activityTypeCode ?? '未知'} ·
               时长 {formatHours(workout.durationMinutes)} ·
-              能量 {formatMetric(workout.totalEnergyKcal)} kcal ·
+              能量 {formatMetric(workout.totalEnergyKcal)} 千卡 ·
               距离 {formatMetric(workout.totalDistanceKm, 2)} km
             </Text>
           ))
@@ -682,20 +683,37 @@ function getSettingsBridge():
     return null;
   }
 
-  const settingsBridge = Settings as
-    | {
-        get?: (key: string) => unknown;
-        set?: (settings: Record<string, unknown>) => void;
-      }
-    | undefined;
-
-  if (!settingsBridge || typeof settingsBridge.get !== 'function' || typeof settingsBridge.set !== 'function') {
-    return null;
-  }
-
   return {
-    get: (key: string) => settingsBridge.get!(key),
-    set: (settings: Record<string, unknown>) => settingsBridge.set!(settings),
+    get: (key: string) => {
+      try {
+        const settingsBridge = Settings as
+          | {
+              get?: (targetKey: string) => unknown;
+            }
+          | undefined;
+        if (!settingsBridge || typeof settingsBridge.get !== 'function') {
+          return undefined;
+        }
+        return settingsBridge.get(key);
+      } catch {
+        return undefined;
+      }
+    },
+    set: (settings: Record<string, unknown>) => {
+      try {
+        const settingsBridge = Settings as
+          | {
+              set?: (nextSettings: Record<string, unknown>) => void;
+            }
+          | undefined;
+        if (!settingsBridge || typeof settingsBridge.set !== 'function') {
+          return;
+        }
+        settingsBridge.set(settings);
+      } catch {
+        return;
+      }
+    },
   };
 }
 
@@ -789,6 +807,10 @@ function LoginScreen(): React.JSX.Element {
   const [sleepAdvice, setSleepAdvice] = useState('');
   const [sleepAdviceLoading, setSleepAdviceLoading] = useState(false);
   const [sleepAdviceUpdatedAt, setSleepAdviceUpdatedAt] = useState<string | null>(null);
+  const [wellnessArticles, setWellnessArticles] = useState<WellnessArticle[]>([]);
+  const [wellnessArticlesLoading, setWellnessArticlesLoading] = useState(false);
+  const [wellnessArticlesError, setWellnessArticlesError] = useState('');
+  const [wellnessArticlesUpdatedAt, setWellnessArticlesUpdatedAt] = useState<string | null>(null);
   const [visualReady, setVisualReady] = useState(false);
   const [activePanel, setActivePanel] = useState<AppPanel>('home');
   const [chatInput, setChatInput] = useState('');
@@ -814,14 +836,14 @@ function LoginScreen(): React.JSX.Element {
 
   const canUseHealth = Boolean(token);
   const isAndroid = Platform.OS === 'android';
-  const healthPanelTitle = isAndroid ? '华为健康全量数据读取' : 'HealthKit 全量数据读取';
+  const healthPanelTitle = isAndroid ? '华为健康同步与建议' : 'Apple 健康同步与建议';
   const healthHintText = isAndroid
-    ? '测试模式下可手动读取华为健康数据或 Mock 数据做可视化验证；登录后会自动同步一次健康数据，正式聊天会在每个新会话首条消息前再读取一次。'
-    : '测试模式下可手动读取 HealthKit 真实数据做可视化验证；登录后会自动同步一次健康数据，正式聊天会在每个新会话首条消息前再读取一次。';
-  const healthRealButtonText = isAndroid ? '读取华为健康数据' : '读取真实数据';
+    ? '可手动同步华为健康数据，也可用演示样本预览界面；登录后会自动同步一次健康数据，正式聊天会在每个新会话首条消息前再读取一次。'
+    : '可手动同步 Apple 健康数据；登录后会自动同步一次健康数据，正式聊天会在每个新会话首条消息前再读取一次。';
+  const healthRealButtonText = isAndroid ? '同步华为健康数据' : '同步 Apple 健康数据';
   const visualPlaceholderText = isAndroid
-    ? '测试模式下点击“读取华为健康数据”或“读取 Mock 数据”后，将进入健康数据可视化页面；登录与正式聊天场景都会自动同步健康数据。'
-    : '测试模式下点击“读取真实数据”后，将进入健康数据可视化页面；登录与正式聊天场景都会自动同步健康数据。';
+    ? '点击“同步华为健康数据”或“使用演示样本”后，这里会展示你的健康总览与养生建议。'
+    : '点击“同步 Apple 健康数据”后，这里会展示你的健康总览与养生建议。';
 
   const avatar = useMemo(() => buildAvatar(currentUser, avatarSeed), [currentUser, avatarSeed]);
   const normalizedUsername = username.trim().toLowerCase();
@@ -1048,6 +1070,53 @@ function LoginScreen(): React.JSX.Element {
       })),
     }));
   }, [token]);
+
+  const loadWellnessArticles = useCallback(async () => {
+    const normalizedBase = normalizeApiBase();
+    setWellnessArticlesLoading(true);
+    setWellnessArticlesError('');
+
+    try {
+      const response = await fetch(`${normalizedBase}/api/content/articles?limit=6`);
+      const { data } = await readApiResponse<{
+        message?: string;
+        articles?: WellnessArticle[];
+        lastSyncedAt?: string | null;
+      }>(response);
+
+      if (!response.ok || !Array.isArray(data?.articles)) {
+        const fallbackMessage =
+          response.status >= 500
+            ? `服务暂时不可用（HTTP ${response.status}）`
+            : `养生文章加载失败（HTTP ${response.status}）`;
+        throw new Error(localizeErrorMessage(data?.message ?? '', fallbackMessage));
+      }
+
+      setWellnessArticles(
+        data.articles.map((article) => ({
+          slug: article.slug,
+          title: article.title,
+          summary: article.summary,
+          author: article.author,
+          sourceName: article.sourceName,
+          sourceSection: article.sourceSection,
+          sourceDomain: article.sourceDomain,
+          sourceUrl: article.sourceUrl,
+          publishedAt: article.publishedAt,
+          coverImageUrl: article.coverImageUrl,
+          contentBlocks: Array.isArray(article.contentBlocks) ? article.contentBlocks : [],
+          tags: Array.isArray(article.tags) ? article.tags : [],
+          updatedAt: article.updatedAt,
+        }))
+      );
+      setWellnessArticlesUpdatedAt(data.lastSyncedAt ?? null);
+    } catch (error) {
+      const rawMessage = error instanceof Error ? error.message : '';
+      setWellnessArticlesError(localizeErrorMessage(rawMessage, '养生文章加载失败'));
+    } finally {
+      setWellnessArticlesLoading(false);
+    }
+  }, []);
 
   const persistChatSessionToServer = useCallback(
     async (sessionId: number, messages: ChatMessage[], meta?: Partial<ChatSessionRecord>): Promise<ChatSessionRecord | null> => {
@@ -1740,6 +1809,17 @@ function LoginScreen(): React.JSX.Element {
     };
   }, [token, fetchStoredChatSessions, syncHealthSnapshot, fetchHealthProfile, startProactiveLoginReview]);
 
+  useEffect(() => {
+    if (!token) {
+      setWellnessArticles([]);
+      setWellnessArticlesError('');
+      setWellnessArticlesUpdatedAt(null);
+      return;
+    }
+
+    loadWellnessArticles().catch(() => {});
+  }, [token, loadWellnessArticles]);
+
   const onLoadHealthData = async (useMock = false) => {
     if (!canUseHealth) {
       Alert.alert('提示', '请先登录后再读取健康数据');
@@ -2023,7 +2103,8 @@ function LoginScreen(): React.JSX.Element {
       ) : null}
 
       <KeyboardAvoidingView
-        behavior={Platform.OS === 'ios' ? 'padding' : undefined}
+        behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
+        keyboardVerticalOffset={Platform.OS === 'ios' ? 16 : 0}
         style={styles.flex}
       >
         {token && activePanel === 'chat' ? (
@@ -2489,7 +2570,7 @@ function LoginScreen(): React.JSX.Element {
               <>
                 <View style={[styles.card, styles.homeEntryCard]}>
                   <Text style={styles.testHomeTitle}>欢迎回来，{currentUser?.name || '同学'}</Text>
-                  <Text style={styles.testHomeDesc}>新对话放在主入口，历史放在并列次入口，避免先进入聊天页再找会话。</Text>
+                  <Text style={styles.testHomeDesc}>从这里继续对话、同步健康数据，并查看今天的青年养生文章。</Text>
                   <View style={styles.homePrimaryActionRow}>
                     <Pressable
                       style={[styles.button, styles.homePrimaryActionButton]}
@@ -2507,7 +2588,7 @@ function LoginScreen(): React.JSX.Element {
                     </Pressable>
                   </View>
                   <Pressable style={styles.homeTertiaryAction} onPress={() => setTestMode(true)}>
-                    <Text style={styles.homeTertiaryActionText}>进入测试模式</Text>
+                    <Text style={styles.homeTertiaryActionText}>进入健康小助手</Text>
                   </Pressable>
                 </View>
 
@@ -2561,7 +2642,7 @@ function LoginScreen(): React.JSX.Element {
             {token && testMode ? (
               <View style={[styles.card, styles.cardExpanded]}>
                 <View style={styles.testModeHeader}>
-                  <Text style={styles.testModeTitle}>测试模式</Text>
+                  <Text style={styles.testModeTitle}>健康小助手</Text>
                   <Pressable style={styles.testModeBackButton} onPress={() => setTestMode(false)}>
                     <Text style={styles.testModeBackText}>返回</Text>
                   </Pressable>
@@ -2588,7 +2669,7 @@ function LoginScreen(): React.JSX.Element {
                       onPress={() => onLoadHealthData(true)}
                       disabled={healthLoading}
                     >
-                      <Text style={styles.healthActionText}>读取 Mock 数据</Text>
+                      <Text style={styles.healthActionText}>使用演示样本</Text>
                     </Pressable>
                   ) : null}
                 </View>
@@ -2613,20 +2694,31 @@ function LoginScreen(): React.JSX.Element {
                   </View>
                 ) : null}
 
-                {visualReady && healthSnapshot ? (
-                  <ScrollView
-                    style={styles.visualScroll}
-                    contentContainerStyle={styles.visualScrollContent}
-                    showsVerticalScrollIndicator
-                  >
+                <ScrollView
+                  style={styles.visualScroll}
+                  contentContainerStyle={styles.visualScrollContent}
+                  showsVerticalScrollIndicator
+                >
+                  {visualReady && healthSnapshot ? (
                     <HealthInsightsBoard snapshot={healthSnapshot} />
-                    {SHOW_HEALTH_RAW_PANEL ? <SnapshotRawPanel snapshot={healthSnapshot} /> : null}
-                  </ScrollView>
-                ) : (
-                  <View style={styles.visualPlaceholder}>
-                    <Text style={styles.visualPlaceholderText}>{visualPlaceholderText}</Text>
-                  </View>
-                )}
+                  ) : (
+                    <View style={styles.visualPlaceholder}>
+                      <Text style={styles.visualPlaceholderText}>{visualPlaceholderText}</Text>
+                    </View>
+                  )}
+                  {visualReady && healthSnapshot && SHOW_HEALTH_RAW_PANEL ? (
+                    <SnapshotRawPanel snapshot={healthSnapshot} />
+                  ) : null}
+                  <WellnessArticleShelf
+                    articles={wellnessArticles}
+                    error={wellnessArticlesError}
+                    loading={wellnessArticlesLoading}
+                    lastSyncedAt={wellnessArticlesUpdatedAt}
+                    onRefresh={() => {
+                      loadWellnessArticles().catch(() => {});
+                    }}
+                  />
+                </ScrollView>
               </View>
             ) : null}
           </ScrollView>
